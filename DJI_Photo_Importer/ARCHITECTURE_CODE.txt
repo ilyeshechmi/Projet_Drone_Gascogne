@@ -1,0 +1,169 @@
+GUIDE DES FICHIERS SOURCE
+
+Ce document indique où commencer la lecture du code et quelle responsabilité
+appartient à chaque fichier. Les données, l'interface et les copies sont
+volontairement séparées pour éviter qu'une modification graphique touche à la
+sécurité des transferts.
+
+DJI Photo Importer.command
+
+Ce lanceur zsh est destiné au double-clic dans le Finder. Il localise Python
+dans ../env_drone, se place dans le dossier de l'application et lance
+drone_photo_importer.py avec les bibliothèques Qt cohérentes de cet environnement.
+
+drone_photo_importer.py
+
+C'est le lanceur Python visible à la racine. Il ne contient aucune logique
+métier. Il transmet simplement les arguments à drone_importer/main.py.
+
+Exemples d'arguments :
+
+    --scan
+    --import-all
+    --gap-minutes 5
+
+get_latest_drone_photo.py
+
+C'est le premier script historique, conservé fonctionnel. Il contient les
+briques bas niveau déjà testées avec le vrai drone :
+
+- lecture de system_profiler pour détecter DJI ;
+- association des périphériques USB avec diskutil ;
+- recherche des volumes montés ;
+- lecture manuelle de DateTimeOriginal dans JPEG et DNG ;
+- scan récursif des photos ;
+- copie de la seule photo la plus récente.
+
+La nouvelle application réutilise sa détection USB, son lecteur EXIF, ses
+messages d'erreur et sa constante de destination.
+
+drone_importer/__init__.py
+
+Ce fichier transforme le dossier drone_importer en paquet Python. Il expose une
+petite API publique pour les autres scripts : DronePhoto, ScanResult et
+scan_drone_photos.
+
+drone_importer/__main__.py
+
+Ce fichier permet le lancement suivant :
+
+    python -m drone_importer
+
+Il redirige immédiatement vers la fonction run de main.py.
+
+drone_importer/core.py
+
+Ce module représente les données du drone et réalise le scan complet.
+
+DronePhoto contient le nom, le chemin source, le format, la taille, les dates,
+la date EXIF et une identité persistante. Cette identité combine le volume, le
+chemin, la taille et les dates sans lire tout le contenu pendant le scan.
+
+ScanResult regroupe le drone détecté, ses stockages, les photos, les dossiers
+et les avertissements.
+
+scan_drone_photos détecte le DJI, parcourt ses volumes et retourne les photos
+triées. Ce module ne connaît ni l'interface ni l'historique.
+
+drone_importer/history.py
+
+Ce module gère drone_sync.json.
+
+SyncHistory charge les imports précédents, sépare les photos déjà importées des
+nouvelles et ajoute un enregistrement après transfert. Il vérifie également que
+la copie locale existe encore avec la bonne taille.
+
+L'enregistrement est atomique : le JSON complet est écrit et synchronisé dans
+un fichier temporaire, puis os.replace remplace l'ancien historique. Un arrêt
+pendant l'écriture ne laisse pas un demi-fichier JSON.
+
+drone_importer/missions.py
+
+Ce module contient le regroupement chronologique indépendant de l'interface.
+
+group_photos_into_missions trie les photos et démarre une nouvelle mission si
+l'écart entre deux photos consécutives dépasse le seuil demandé.
+
+build_import_plan forme d'abord les missions avec toutes les photos, puis retire
+les photos déjà importées. Cette méthode garde le même dossier de mission après
+une interruption.
+
+drone_importer/transfer.py
+
+Ce module effectue les copies réelles.
+
+Avant de commencer, il vérifie les collisions de noms et prend un verrou pour
+empêcher deux imports simultanés. Chaque image est copiée vers un fichier
+temporaire unique. Le code calcule un checksum SHA-256 pendant la copie, relit
+le fichier local, vérifie le résultat puis effectue un remplacement atomique.
+
+L'historique est mis à jour seulement après cette validation. Si le transfert
+s'arrête, seules les photos réellement vérifiées sont considérées importées.
+
+drone_importer/gui.py
+
+Ce module construit l'interface PyQt5.
+
+MainWindow contient les widgets, affiche les missions et récupère les choix de
+l'utilisateur. Elle ne scanne ni ne copie directement les photos.
+
+ConnectionWorker, ScanWorker et TransferWorker exécutent les opérations longues
+dans des QThread. Leurs signaux renvoient les résultats et la progression au
+thread graphique. La fenêtre reste ainsi réactive pendant le scan et l'import.
+
+Le même module crée le journal logs/drone_importer.log et transforme les erreurs
+métier en messages compréhensibles.
+
+drone_importer/main.py
+
+Ce module choisit le mode de fonctionnement.
+
+Sans argument, il ouvre l'interface graphique. Avec --scan, il affiche le
+diagnostic sans copier. Avec --import-all, il importe toutes les nouvelles
+missions depuis le terminal.
+
+Il centralise également les erreurs attendues pour éviter d'afficher un long
+traceback Python à l'utilisateur.
+
+tests/test_drone_importer.py
+
+Ce fichier teste le cœur métier avec des dossiers temporaires. Il ne touche pas
+au vrai drone_sync.json et n'importe pas les photos réelles du drone.
+
+Les tests couvrent :
+
+- le premier scan, le second scan et une nouvelle photo ;
+- le regroupement temporel en missions ;
+- la conservation exacte des sources ;
+- la reprise après interruption ;
+- le refus d'une source modifiée après le scan ;
+- la détection d'une corruption au milieu d'un fichier.
+
+requirements-drone-importer.txt
+
+Ce fichier n'est pas du code source. Il indique seulement que l'interface a
+besoin de PyQt5 5.15. Les autres modules utilisent la bibliothèque standard de
+Python et les outils déjà fournis par macOS.
+
+FICHIERS GENERES
+
+drone_sync.json est créé après le premier import réussi.
+
+logs/drone_importer.log contient les détails techniques des erreurs.
+
+DronePhotos contient les dossiers de missions et les originaux copiés.
+
+__pycache__ contient uniquement le cache Python. Il peut être supprimé et sera
+recréé automatiquement.
+
+ORDRE CONSEILLE POUR LIRE LE CODE
+
+1. drone_photo_importer.py
+2. drone_importer/main.py
+3. drone_importer/core.py
+4. drone_importer/missions.py
+5. drone_importer/history.py
+6. drone_importer/transfer.py
+7. drone_importer/gui.py
+8. get_latest_drone_photo.py pour les détails USB et EXIF
+9. tests/test_drone_importer.py pour voir les comportements attendus

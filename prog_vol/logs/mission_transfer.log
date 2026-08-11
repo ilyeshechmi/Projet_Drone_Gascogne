@@ -1,0 +1,68 @@
+2026-08-07 11:05:06,247 | ERROR | Fichier KMZ introuvable : /Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/mission_waypoints.kmz
+2026-08-07 11:05:19,749 | ERROR | Aucun stockage DJI Fly accessible. Branchez la radiocommande en mode transfert de fichiers, ou indiquez --device-root / --mtp-uri.
+2026-08-07 11:10:46,263 | ERROR | Aucun stockage DJI Fly accessible. Branchez la radiocommande en mode transfert de fichiers, ou indiquez --device-root / --mtp-uri.
+2026-08-07 11:15:29,334 | ERROR | Aucun stockage DJI Fly accessible. Branchez la radiocommande en mode transfert de fichiers, ou indiquez --device-root / --mtp-uri.
+2026-08-07 11:34:06,939 | ERROR | Aucun stockage DJI Fly accessible. Branchez la radiocommande en mode transfert de fichiers, installez libmtp, ou indiquez --device-root / --mtp-uri.
+2026-08-07 11:41:35,643 | ERROR | Aucune mission .kmz n'existe dans DJI Fly. Créez d'abord une mission brouillon dans DJI Fly, puis relancez le programme.
+2026-08-07 11:45:30,359 | INFO | Simulation : aucune écriture sur libmtp://00010001/Android/data/dji.go.v5/files/waypoint/8F883584-DE8C-4C9B-B1FA-C2F46EF0735F/8F883584-DE8C-4C9B-B1FA-C2F46EF0735F.kmz
+2026-08-07 11:48:27,855 | INFO | Simulation : aucune écriture sur libmtp://00010001/Android/data/dji.go.v5/files/waypoint/8F883584-DE8C-4C9B-B1FA-C2F46EF0735F/8F883584-DE8C-4C9B-B1FA-C2F46EF0735F.kmz
+2026-08-07 11:50:52,054 | INFO | Mission transférée et vérifiée vers libmtp://00010001/Android/data/dji.go.v5/files/waypoint/8F883584-DE8C-4C9B-B1FA-C2F46EF0735F/8F883584-DE8C-4C9B-B1FA-C2F46EF0735F.kmz
+2026-08-07 12:01:28,345 | INFO | Mission transférée et vérifiée vers libmtp://00010001/Android/data/dji.go.v5/files/waypoint/8F883584-DE8C-4C9B-B1FA-C2F46EF0735F/8F883584-DE8C-4C9B-B1FA-C2F46EF0735F.kmz
+2026-08-07 16:58:52,502 | ERROR | Échec d'une opération graphique
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/gui.py", line 88, in run
+    self.succeeded.emit(self.work())
+                        ~~~~~~~~~^^
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/gui.py", line 131, in work
+    result = generate_mission(self.points, self.parameters, self.output_path)
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/generator.py", line 397, in generate_mission
+    waypoints, line_count, fov_width, fov_height = generate_waypoints_polygon(
+                                                   ~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        polygon_points,
+        ^^^^^^^^^^^^^^^
+        parameters,
+        ^^^^^^^^^^^
+    )
+    ^
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/generator.py", line 204, in generate_waypoints_polygon
+    raise GenerationError(
+        "Aucun waypoint n'a été généré. Vérifiez la forme et la taille du polygone."
+    )
+prog_vol.generator.GenerationError: Aucun waypoint n'a été généré. Vérifiez la forme et la taille du polygone.
+2026-08-07 17:00:47,669 | INFO | Mission transférée et vérifiée vers libmtp://00010001/Android/data/dji.go.v5/files/waypoint/8F883584-DE8C-4C9B-B1FA-C2F46EF0735F/8F883584-DE8C-4C9B-B1FA-C2F46EF0735F.kmz
+2026-08-10 14:56:23,964 | ERROR | Échec d'une opération graphique
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/gui.py", line 88, in run
+    self.succeeded.emit(self.work())
+                        ~~~~~~~~~^^
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/gui.py", line 163, in work
+    storage = detect_storage()
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/mtp.py", line 1031, in detect_storage
+    raise StorageError(
+    ...<2 lines>...
+    )
+prog_vol.mtp.StorageError: Aucun stockage DJI Fly accessible. Branchez la radiocommande en mode transfert de fichiers, installez libmtp, ou indiquez --device-root / --mtp-uri.
+2026-08-10 15:22:31,018 | ERROR | Échec d'une opération graphique
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/gui.py", line 88, in run
+    self.succeeded.emit(self.work())
+                        ~~~~~~~~~^^
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/gui.py", line 163, in work
+    storage = detect_storage()
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/mtp.py", line 1031, in detect_storage
+    raise StorageError(
+    ...<2 lines>...
+    )
+prog_vol.mtp.StorageError: Aucun stockage DJI Fly accessible. Branchez la radiocommande en mode transfert de fichiers, installez libmtp, ou indiquez --device-root / --mtp-uri.
+2026-08-10 15:23:13,642 | ERROR | Échec d'une opération graphique
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/gui.py", line 88, in run
+    self.succeeded.emit(self.work())
+                        ~~~~~~~~~^^
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/gui.py", line 163, in work
+    storage = detect_storage()
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/prog_vol/mtp.py", line 1031, in detect_storage
+    raise StorageError(
+    ...<2 lines>...
+    )
+prog_vol.mtp.StorageError: Aucun stockage DJI Fly accessible. Branchez la radiocommande en mode transfert de fichiers, installez libmtp, ou indiquez --device-root / --mtp-uri.

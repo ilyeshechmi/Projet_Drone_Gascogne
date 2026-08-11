@@ -1,0 +1,24 @@
+2026-08-06 17:11:44,262 | ERROR | Dummy-1 | Echec de l'analyse du drone
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/drone_importer/gui.py", line 116, in run
+    scan = scan_drone_photos(
+        include_jpeg=self.include_jpeg,
+        include_dng=self.include_dng,
+    )
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/drone_importer/core.py", line 130, in scan_drone_photos
+    raise DroneError(
+    ...<2 lines>...
+    )
+get_latest_drone_photo.DroneError: Aucun drone DJI detecte. Verifiez l'alimentation, le cable USB de donnees et le mode de transfert. Volumes montes: Macintosh HD
+2026-08-06 17:11:49,655 | ERROR | Dummy-2 | Echec de l'analyse du drone
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/drone_importer/gui.py", line 116, in run
+    scan = scan_drone_photos(
+        include_jpeg=self.include_jpeg,
+        include_dng=self.include_dng,
+    )
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/drone_importer/core.py", line 130, in scan_drone_photos
+    raise DroneError(
+    ...<2 lines>...
+    )
+get_latest_drone_photo.DroneError: Aucun drone DJI detecte. Verifiez l'alimentation, le cable USB de donnees et le mode de transfert. Volumes montes: Macintosh HD
