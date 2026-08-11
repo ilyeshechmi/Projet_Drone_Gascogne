@@ -36,16 +36,45 @@ MAP_HTML = """<!DOCTYPE html>
   <div id="hint" class="map-hint">Cliquez sur la carte pour placer les sommets.</div>
   <script>
     const map = L.map('map', { zoomControl: true }).setView([44.8378, -0.5792], 14);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    const fondOpenStreetMap = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 20,
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
+    const coucheCadastre = L.tileLayer(
+      'https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0' +
+      '&LAYER=CADASTRALPARCELS.PARCELLAIRE_EXPRESS&STYLE=PCI%20vecteur' +
+      '&FORMAT=image/png&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}',
+      {
+        minZoom: 14,
+        maxZoom: 20,
+        opacity: 0.78,
+        attribution: '&copy; IGN - Parcellaire Express (PCI)'
+      }
+    );
+    L.control.layers(
+      {'OpenStreetMap': fondOpenStreetMap},
+      {'Parcelles cadastrales officielles': coucheCadastre},
+      {collapsed: false}
+    ).addTo(map);
 
     let bridge = null;
+    let modeSelection = 'dessin';
+    let interactionActive = true;
     let points = [];
     let pointMarkers = [];
     let outline = null;
     let waypointLayer = L.layerGroup().addTo(map);
+    let parcellesSelectionnees = L.geoJSON(null, {
+      style: {color:'#ad5a13', weight:3, fillColor:'#f2a65a', fillOpacity:.27},
+      onEachFeature: function(feature, layer) {
+        const proprietes = feature.properties || {};
+        if (proprietes['référence']) {
+          layer.bindTooltip(
+            proprietes['référence'] + ' — ' + (proprietes['contenance_m²'] || 0) + ' m²'
+          );
+        }
+      }
+    }).addTo(map);
     let drawingClosed = false;
 
     new QWebChannel(qt.webChannelTransport, function(channel) {
@@ -54,6 +83,10 @@ MAP_HTML = """<!DOCTYPE html>
 
     function updateHint() {
       const hint = document.getElementById('hint');
+      if (modeSelection === 'cadastre') {
+        hint.textContent = 'Mode cadastral : cliquez au centre d’une parcelle de Gironde.';
+        return;
+      }
       if (drawingClosed) {
         hint.textContent = 'Zone fermée. Générez la mission ou réinitialisez la carte.';
       } else if (points.length < 3) {
@@ -74,7 +107,12 @@ MAP_HTML = """<!DOCTYPE html>
     }
 
     map.on('click', function(event) {
-      if (drawingClosed || !bridge) return;
+      if (!bridge || !interactionActive) return;
+      if (modeSelection === 'cadastre') {
+        bridge.selectionnerParcelle(event.latlng.lat, event.latlng.lng);
+        return;
+      }
+      if (drawingClosed) return;
       const point = [event.latlng.lat, event.latlng.lng];
       points.push(point);
       const marker = L.circleMarker(point, {
@@ -97,6 +135,31 @@ MAP_HTML = """<!DOCTYPE html>
         if (outline) map.fitBounds(outline.getBounds(), {padding:[35,35]});
         updateHint();
       },
+      setModeSelection: function(mode) {
+        modeSelection = mode === 'cadastre' ? 'cadastre' : 'dessin';
+        if (modeSelection === 'cadastre' && !map.hasLayer(coucheCadastre)) {
+          coucheCadastre.addTo(map);
+        }
+        updateHint();
+      },
+      setInteractionActive: function(active) {
+        interactionActive = Boolean(active);
+      },
+      setMissionPolygon: function(coordinates) {
+        pointMarkers.forEach(marker => map.removeLayer(marker));
+        pointMarkers = [];
+        points = coordinates || [];
+        drawingClosed = points.length >= 3;
+        redrawOutline(drawingClosed);
+        if (outline) map.fitBounds(outline.getBounds(), {padding:[35,35]});
+        updateHint();
+      },
+      afficherParcellesSelectionnees: function(collection) {
+        parcellesSelectionnees.clearLayers();
+        if (collection && collection.features) {
+          parcellesSelectionnees.addData(collection);
+        }
+      },
       reset: function() {
         pointMarkers.forEach(marker => map.removeLayer(marker));
         pointMarkers = [];
@@ -105,6 +168,7 @@ MAP_HTML = """<!DOCTYPE html>
         if (outline) map.removeLayer(outline);
         outline = null;
         waypointLayer.clearLayers();
+        parcellesSelectionnees.clearLayers();
         updateHint();
       },
       showWaypoints: function(coordinates) {
@@ -128,15 +192,21 @@ MAP_HTML = """<!DOCTYPE html>
 
 class MapBridge(QObject):
     point_added = pyqtSignal(float, float)
+    parcelle_demandee = pyqtSignal(float, float)
 
     @pyqtSlot(float, float)
     def addPoint(self, latitude: float, longitude: float) -> None:
         self.point_added.emit(latitude, longitude)
 
+    @pyqtSlot(float, float)
+    def selectionnerParcelle(self, latitude: float, longitude: float) -> None:
+        self.parcelle_demandee.emit(latitude, longitude)
+
 
 class MissionMapWidget(QWidget):
     polygon_changed = pyqtSignal(object)
     polygon_closed_changed = pyqtSignal(bool)
+    parcelle_demandee = pyqtSignal(float, float)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -147,6 +217,7 @@ class MissionMapWidget(QWidget):
         self.view = QWebEngineView(self)
         self.bridge = MapBridge(self)
         self.bridge.point_added.connect(self._point_added)
+        self.bridge.parcelle_demandee.connect(self.parcelle_demandee)
         self.channel = QWebChannel(self.view.page())
         self.channel.registerObject("bridge", self.bridge)
         self.view.page().setWebChannel(self.channel)
@@ -190,6 +261,28 @@ class MissionMapWidget(QWidget):
     def set_center(self, latitude: float, longitude: float, zoom: int = 16) -> None:
         script = f"window.kaelMap.setCenter({float(latitude)}, {float(longitude)}, {int(zoom)});"
         self._run_script(script)
+
+    def set_mode_selection(self, cadastral: bool) -> None:
+        mode = "cadastre" if cadastral else "dessin"
+        self._run_script(f"window.kaelMap.setModeSelection('{mode}');")
+
+    def set_interaction_active(self, active: bool) -> None:
+        valeur = "true" if active else "false"
+        self._run_script(f"window.kaelMap.setInteractionActive({valeur});")
+
+    def set_polygon(self, points: tuple[tuple[float, float], ...]) -> None:
+        if len(points) < 3:
+            raise ValueError("Un contour doit contenir au moins trois sommets.")
+        self._points = [(float(latitude), float(longitude)) for latitude, longitude in points]
+        self._closed = True
+        payload = json.dumps(self._points, separators=(",", ":"))
+        self._run_script(f"window.kaelMap.setMissionPolygon({payload});")
+        self.polygon_changed.emit(self.points)
+        self.polygon_closed_changed.emit(True)
+
+    def afficher_parcelles_selectionnees(self, collection: dict) -> None:
+        payload = json.dumps(collection, ensure_ascii=False, separators=(",", ":"))
+        self._run_script(f"window.kaelMap.afficherParcellesSelectionnees({payload});")
 
     def show_waypoints(self, waypoints: tuple[tuple[float, float, float], ...]) -> None:
         coordinates = [[latitude, longitude] for latitude, longitude, _ in waypoints]

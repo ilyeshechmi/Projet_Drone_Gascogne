@@ -129,7 +129,7 @@ Le nom original de chaque fichier DJI est conserve dans le dossier de mission.
 
 Les missions sont importees dans :
 
-    ~/Desktop/Enseirb/Stage_3A/Kael/DJI_Photo_Importer/DronePhotos/
+    ~/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/DronePhotos/
 
 Exemple :
 

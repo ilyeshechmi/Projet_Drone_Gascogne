@@ -13,6 +13,7 @@ from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QCloseEvent, QFont
 from PyQt5.QtWidgets import (
     QApplication,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -34,6 +35,14 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from .cadastre import (
+    CadastreGironde,
+    ErreurCadastre,
+    ParcelleCadastrale,
+    ResultatFusion,
+    collection_geojson,
+    fusionner_parcelles,
+)
 from .generator import (
     GenerationError,
     GenerationResult,
@@ -68,7 +77,7 @@ def human_size(size: int) -> str:
 def friendly_error(exc: Exception) -> str:
     if isinstance(
         exc,
-        (GenerationError, MissionError, StorageError, TransferError, OSError),
+        (ErreurCadastre, GenerationError, MissionError, StorageError, TransferError, OSError),
     ):
         return str(exc)
     return "Une erreur inattendue est survenue. Consultez le journal de l'application."
@@ -130,6 +139,19 @@ class GenerationWorker(Worker):
     def work(self) -> tuple[GenerationResult, MissionArchive]:
         result = generate_mission(self.points, self.parameters, self.output_path)
         return result, inspect_mission(result.output_path)
+
+
+class InstallationCadastreWorker(Worker):
+    progression = pyqtSignal(str, int)
+
+    def __init__(self, cadastre: CadastreGironde) -> None:
+        super().__init__()
+        self.cadastre = cadastre
+
+    def work(self) -> int:
+        return self.cadastre.installer(
+            lambda message, pourcentage: self.progression.emit(message, pourcentage)
+        )
 
 
 @dataclass(frozen=True)
@@ -299,7 +321,7 @@ class ThreadedPanel(QWidget):
 
     @pyqtSlot(str)
     def worker_failed(self, message: str) -> None:
-        QMessageBox.critical(self, "Projet Kael", message)
+        QMessageBox.critical(self, "Projet Drone Gascogne", message)
 
     @pyqtSlot()
     def worker_finished(self) -> None:
@@ -314,7 +336,11 @@ class GenerationTab(ThreadedPanel):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.cadastre = CadastreGironde()
+        self.parcelles_selectionnees: dict[str, ParcelleCadastrale] = {}
         self._build_ui()
+        self.actualiser_etat_cadastre()
+        self.changer_mode_zone(0)
 
     def _spin(
         self,
@@ -344,7 +370,7 @@ class GenerationTab(ThreadedPanel):
         heading.setFont(QFont("Arial", 21, QFont.Bold))
         layout.addWidget(heading)
         subtitle = QLabel(
-            "Localisez la zone, dessinez son contour puis générez une mission DJI validée."
+            "Dessinez une zone ou sélectionnez des parcelles cadastrales, puis générez une mission DJI validée."
         )
         subtitle.setObjectName("muted")
         layout.addWidget(subtitle)
@@ -374,6 +400,59 @@ class GenerationTab(ThreadedPanel):
         self.location_status.setObjectName("mutedSmall")
         self.location_status.setWordWrap(True)
         controls_layout.addWidget(self.location_status)
+
+        controls_layout.addWidget(self._section_label("Parcelles cadastrales de Gironde"))
+        self.cadastre_status = QLabel()
+        self.cadastre_status.setObjectName("mutedSmall")
+        self.cadastre_status.setWordWrap(True)
+        controls_layout.addWidget(self.cadastre_status)
+        self.cadastre_progress = QProgressBar()
+        self.cadastre_progress.setRange(0, 100)
+        self.cadastre_progress.setVisible(False)
+        controls_layout.addWidget(self.cadastre_progress)
+        self.install_cadastre_button = QPushButton("Installer les données cadastrales")
+        self.install_cadastre_button.setObjectName("secondaryButton")
+        self.install_cadastre_button.clicked.connect(self.installer_cadastre)
+        controls_layout.addWidget(self.install_cadastre_button)
+
+        self.mode_zone = QComboBox()
+        self.mode_zone.addItems(("Dessin libre", "Sélection cadastrale"))
+        controls_layout.addWidget(self.mode_zone)
+
+        reference_form = QFormLayout()
+        reference_form.setSpacing(7)
+        self.commune_cadastrale = QLineEdit()
+        self.commune_cadastrale.setPlaceholderText("Ex. 33522 pour Talence")
+        self.prefixe_cadastral = QLineEdit()
+        self.prefixe_cadastral.setPlaceholderText("Optionnel, ex. 000")
+        self.section_cadastrale = QLineEdit()
+        self.section_cadastrale.setPlaceholderText("Ex. AB")
+        self.numero_parcelle = QLineEdit()
+        self.numero_parcelle.setPlaceholderText("Ex. 402")
+        reference_form.addRow("Code INSEE de la commune", self.commune_cadastrale)
+        reference_form.addRow("Préfixe cadastral", self.prefixe_cadastral)
+        reference_form.addRow("Section cadastrale", self.section_cadastrale)
+        reference_form.addRow("Numéro de parcelle", self.numero_parcelle)
+        controls_layout.addLayout(reference_form)
+        self.search_parcelle_button = QPushButton("Rechercher et ajouter la parcelle")
+        self.search_parcelle_button.clicked.connect(self.rechercher_parcelle)
+        controls_layout.addWidget(self.search_parcelle_button)
+
+        self.parcelles_status = QLabel("Aucune parcelle cadastrale sélectionnée.")
+        self.parcelles_status.setObjectName("mutedSmall")
+        self.parcelles_status.setWordWrap(True)
+        controls_layout.addWidget(self.parcelles_status)
+        self.parcelles_list = QListWidget()
+        self.parcelles_list.setMaximumHeight(125)
+        controls_layout.addWidget(self.parcelles_list)
+        parcelles_buttons = QHBoxLayout()
+        self.remove_parcelle_button = QPushButton("Retirer la parcelle")
+        self.remove_parcelle_button.clicked.connect(self.retirer_parcelle)
+        self.clear_parcelles_button = QPushButton("Effacer la sélection")
+        self.clear_parcelles_button.clicked.connect(self.effacer_parcelles)
+        parcelles_buttons.addWidget(self.remove_parcelle_button)
+        parcelles_buttons.addWidget(self.clear_parcelles_button)
+        controls_layout.addLayout(parcelles_buttons)
 
         controls_layout.addWidget(self._section_label("Paramètres de vol"))
         form = QFormLayout()
@@ -431,6 +510,8 @@ class GenerationTab(ThreadedPanel):
         self.map_widget.setMinimumSize(520, 480)
         self.map_widget.polygon_changed.connect(self.polygon_changed)
         self.map_widget.polygon_closed_changed.connect(self.polygon_closed_changed)
+        self.map_widget.parcelle_demandee.connect(self.selectionner_parcelle_sur_carte)
+        self.mode_zone.currentIndexChanged.connect(self.changer_mode_zone)
         splitter.addWidget(controls_scroll)
         splitter.addWidget(self.map_widget)
         splitter.setSizes([360, 900])
@@ -468,6 +549,185 @@ class GenerationTab(ThreadedPanel):
         self.map_widget.set_center(latitude, longitude)
         self.location_status.setText(address)
 
+    def actualiser_etat_cadastre(self) -> None:
+        installe = self.cadastre.est_installe
+        if installe:
+            informations = self.cadastre.informations()
+            nombre = int(informations.get("nombre_parcelles", "0"))
+            version = informations.get("version_donnees", "inconnue")
+            self.cadastre_status.setText(
+                f"Données installées : {nombre:,} parcelles de Gironde, "
+                f"version {version}.".replace(",", " ")
+            )
+            self.install_cadastre_button.setText("Mettre à jour les données cadastrales")
+        else:
+            self.cadastre_status.setText(
+                "Données non installées. Téléchargement initial : environ 236 Mo; "
+                "prévoir 3 Go d'espace libre pendant l'indexation."
+            )
+            self.install_cadastre_button.setText("Installer les données cadastrales")
+        self.search_parcelle_button.setEnabled(
+            not self.busy and installe and self.mode_zone.currentIndex() == 1
+        )
+
+    def installer_cadastre(self) -> None:
+        action = "mettre à jour" if self.cadastre.est_installe else "installer"
+        confirmation = QMessageBox.question(
+            self,
+            "Données cadastrales de Gironde",
+            f"Voulez-vous {action} la base officielle des parcelles de Gironde ?\n\n"
+            "Le téléchargement représente environ 236 Mo et l'indexation peut durer "
+            "plusieurs minutes.",
+        )
+        if confirmation != QMessageBox.Yes:
+            return
+        worker = InstallationCadastreWorker(self.cadastre)
+        worker.progression.connect(self.progression_cadastre)
+        self.cadastre_progress.setVisible(True)
+        self.cadastre_progress.setValue(0)
+        self.start_worker(worker, self.cadastre_installe)
+
+    @pyqtSlot(str, int)
+    def progression_cadastre(self, message: str, pourcentage: int) -> None:
+        self.cadastre_status.setText(message)
+        self.cadastre_progress.setValue(pourcentage)
+
+    @pyqtSlot(object)
+    def cadastre_installe(self, nombre: object) -> None:
+        self.cadastre_progress.setValue(100)
+        self.cadastre_progress.setVisible(False)
+        self.parcelles_selectionnees.clear()
+        self.parcelles_list.clear()
+        self.map_widget.reset()
+        self.map_widget.set_mode_selection(self.mode_zone.currentIndex() == 1)
+        self.parcelles_status.setText("Aucune parcelle cadastrale sélectionnée.")
+        self.result_label.setText("La mission générée sera résumée ici.")
+        self.actualiser_etat_cadastre()
+        QMessageBox.information(
+            self,
+            "Données cadastrales prêtes",
+            f"La base locale contient {int(nombre):,} parcelles de Gironde.".replace(",", " "),
+        )
+
+    @pyqtSlot(int)
+    def changer_mode_zone(self, index: int) -> None:
+        cadastral = index == 1
+        if cadastral and not self.cadastre.est_installe:
+            QMessageBox.information(
+                self,
+                "Sélection cadastrale",
+                "Installez d'abord les données cadastrales de Gironde.",
+            )
+            self.mode_zone.blockSignals(True)
+            self.mode_zone.setCurrentIndex(0)
+            self.mode_zone.blockSignals(False)
+            cadastral = False
+        self.parcelles_selectionnees.clear()
+        self.parcelles_list.clear()
+        self.map_widget.reset()
+        self.map_widget.set_mode_selection(cadastral)
+        self.parcelles_status.setText("Aucune parcelle cadastrale sélectionnée.")
+        self.result_label.setText("La mission générée sera résumée ici.")
+        self.search_parcelle_button.setEnabled(cadastral)
+        for widget in (
+            self.commune_cadastrale,
+            self.prefixe_cadastral,
+            self.section_cadastrale,
+            self.numero_parcelle,
+            self.parcelles_list,
+            self.remove_parcelle_button,
+            self.clear_parcelles_button,
+        ):
+            widget.setEnabled(cadastral)
+        self.close_button.setVisible(not cadastral)
+
+    def rechercher_parcelle(self) -> None:
+        try:
+            parcelle = self.cadastre.rechercher_reference(
+                self.commune_cadastrale.text(),
+                self.section_cadastrale.text(),
+                self.numero_parcelle.text(),
+                self.prefixe_cadastral.text(),
+            )
+            self.ajouter_ou_retirer_parcelle(parcelle)
+        except ErreurCadastre as exc:
+            QMessageBox.warning(self, "Recherche cadastrale", str(exc))
+
+    @pyqtSlot(float, float)
+    def selectionner_parcelle_sur_carte(self, latitude: float, longitude: float) -> None:
+        if self.busy or self.mode_zone.currentIndex() != 1:
+            return
+        try:
+            parcelle = self.cadastre.rechercher_point(latitude, longitude)
+            self.ajouter_ou_retirer_parcelle(parcelle)
+        except ErreurCadastre as exc:
+            QMessageBox.information(self, "Sélection cadastrale", str(exc))
+
+    def ajouter_ou_retirer_parcelle(self, parcelle: ParcelleCadastrale) -> None:
+        nouvelle_selection = dict(self.parcelles_selectionnees)
+        if parcelle.identifiant in nouvelle_selection:
+            nouvelle_selection.pop(parcelle.identifiant)
+        else:
+            nouvelle_selection[parcelle.identifiant] = parcelle
+        fusion: ResultatFusion | None = None
+        if nouvelle_selection:
+            try:
+                fusion = fusionner_parcelles(list(nouvelle_selection.values()))
+            except ErreurCadastre as exc:
+                QMessageBox.warning(self, "Sélection cadastrale refusée", str(exc))
+                return
+        self.parcelles_selectionnees = nouvelle_selection
+        self.actualiser_selection_cadastrale(fusion)
+
+    def actualiser_selection_cadastrale(self, fusion: ResultatFusion | None = None) -> None:
+        parcelles = list(self.parcelles_selectionnees.values())
+        self.parcelles_list.clear()
+        for parcelle in sorted(
+            parcelles,
+            key=lambda item: (item.commune, item.prefixe, item.section, item.numero),
+        ):
+            item = QListWidgetItem(parcelle.description)
+            item.setData(Qt.UserRole, parcelle.identifiant)
+            self.parcelles_list.addItem(item)
+        self.map_widget.afficher_parcelles_selectionnees(collection_geojson(parcelles))
+        if not parcelles:
+            self.map_widget.reset()
+            self.map_widget.set_mode_selection(True)
+            self.parcelles_status.setText("Aucune parcelle cadastrale sélectionnée.")
+            return
+        fusion = fusion or fusionner_parcelles(parcelles)
+        self.map_widget.set_polygon(fusion.points)
+        self.map_widget.set_mode_selection(True)
+        surface = f"{fusion.surface_cadastrale:,}".replace(",", " ")
+        selection = (
+            "1 parcelle sélectionnée"
+            if len(parcelles) == 1
+            else f"{len(parcelles)} parcelles adjacentes"
+        )
+        self.parcelles_status.setText(
+            f"{selection}, surface cadastrale {surface} m²."
+        )
+        self.point_status.setText(
+            f"Contour cadastral prêt avec {len(fusion.points)} sommets."
+        )
+
+    def retirer_parcelle(self) -> None:
+        item = self.parcelles_list.currentItem()
+        if not item:
+            QMessageBox.information(
+                self,
+                "Parcelles cadastrales",
+                "Sélectionnez une parcelle dans la liste avant de la retirer.",
+            )
+            return
+        parcelle = self.parcelles_selectionnees.get(item.data(Qt.UserRole))
+        if parcelle:
+            self.ajouter_ou_retirer_parcelle(parcelle)
+
+    def effacer_parcelles(self) -> None:
+        self.parcelles_selectionnees.clear()
+        self.actualiser_selection_cadastrale()
+
     @pyqtSlot(object)
     def polygon_changed(self, points: object) -> None:
         count = len(points)
@@ -494,7 +754,11 @@ class GenerationTab(ThreadedPanel):
             )
 
     def reset_map(self) -> None:
+        self.parcelles_selectionnees.clear()
+        self.parcelles_list.clear()
+        self.parcelles_status.setText("Aucune parcelle cadastrale sélectionnée.")
         self.map_widget.reset()
+        self.map_widget.set_mode_selection(self.mode_zone.currentIndex() == 1)
         self.result_label.setText("La mission générée sera résumée ici.")
 
     def choose_output_and_generate(self) -> None:
@@ -538,6 +802,7 @@ class GenerationTab(ThreadedPanel):
         )
 
     def set_busy(self, busy: bool) -> None:
+        self.map_widget.set_interaction_active(not busy)
         self.locate_button.setEnabled(not busy)
         self.place_input.setEnabled(not busy)
         self.close_button.setEnabled(
@@ -545,10 +810,29 @@ class GenerationTab(ThreadedPanel):
         )
         self.reset_button.setEnabled(not busy)
         self.generate_button.setEnabled(not busy and self.map_widget.is_closed)
+        self.install_cadastre_button.setEnabled(not busy)
+        self.mode_zone.setEnabled(not busy)
+        cadastral_disponible = (
+            not busy and self.mode_zone.currentIndex() == 1 and self.cadastre.est_installe
+        )
+        for widget in (
+            self.commune_cadastrale,
+            self.prefixe_cadastral,
+            self.section_cadastrale,
+            self.numero_parcelle,
+            self.search_parcelle_button,
+            self.parcelles_list,
+            self.remove_parcelle_button,
+            self.clear_parcelles_button,
+        ):
+            widget.setEnabled(cadastral_disponible)
 
     @pyqtSlot(str)
     def worker_failed(self, message: str) -> None:
-        if isinstance(self.worker, GeocodeWorker):
+        if isinstance(self.worker, InstallationCadastreWorker):
+            self.cadastre_progress.setVisible(False)
+            self.actualiser_etat_cadastre()
+        elif isinstance(self.worker, GeocodeWorker):
             self.location_status.setText(message)
         else:
             self.result_label.setText(message)

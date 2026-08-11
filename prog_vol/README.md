@@ -1,4 +1,4 @@
-# Projet Kael - Génération et transfert de missions DJI
+# Projet Drone Gascogne - Génération et transfert de missions DJI
 
 Cette application réunit dans une seule interface graphique les deux étapes qui
 étaient auparavant séparées :
@@ -7,8 +7,9 @@ Cette application réunit dans une seule interface graphique les deux étapes qu
 2. détecter une radiocommande, choisir une mission DJI Fly existante, sauvegarder
    son fichier puis le remplacer de manière vérifiée.
 
-La version actuelle utilise OpenStreetMap. L'intégration du cadastre n'est pas
-incluse dans ce périmètre.
+La version actuelle utilise OpenStreetMap et permet aussi d'installer localement
+les parcelles cadastrales officielles de Gironde afin de sélectionner une zone
+par clic ou par référence cadastrale.
 
 ## Avertissement de sécurité
 
@@ -26,6 +27,9 @@ terrain et de la réglementation aérienne.
 - recherche d'un lieu avec Nominatim ;
 - carte Leaflet et fond OpenStreetMap ;
 - dessin d'un polygone libre comportant au moins trois sommets ;
+- téléchargement et indexation locale des parcelles cadastrales de Gironde ;
+- recherche par code INSEE, préfixe, section et numéro de parcelle ;
+- sélection par clic et fusion des parcelles adjacentes ;
 - calcul d'une trajectoire en boustrophédon ;
 - aperçu des waypoints et de la trajectoire ;
 - génération d'une archive `wpmz/template.kml` + `wpmz/waylines.wpml` ;
@@ -44,17 +48,23 @@ terrain et de la réglementation aérienne.
 - PyQt5 ;
 - PyQtWebEngine ;
 - geopy ;
+- ijson et Shapely pour l'indexation et les calculs cadastraux ;
 - une connexion Internet pour le géocodage, Leaflet et les tuiles OpenStreetMap ;
 - libmtp sur macOS lorsque la radiocommande n'est pas montée comme un volume.
 
-Le projet contient déjà un environnement virtuel compatible dans `env_drone/`.
+L'environnement virtuel compatible se trouve dans `../env_drone/`, à côté du
+dossier `Projet_Drone_Gascogne/`.
+
+L'installation cadastrale télécharge environ 236 Mo. Il faut prévoir au moins
+3 Go libres pendant la construction de la base locale. La base est conservée
+hors du dépôt, dans le dossier de données de l'utilisateur.
 
 ### Installation avec l'environnement existant
 
-Depuis la racine `Kael/` :
+Depuis la racine `Projet_Drone_Gascogne/` :
 
 ```bash
-source env_drone/bin/activate
+source ../env_drone/bin/activate
 python -m pip install -r prog_vol/requirements.txt
 ```
 
@@ -80,10 +90,10 @@ une application à la fois.
 ## Lancement graphique
 
 La commande doit être exécutée depuis le dossier parent du paquet, donc depuis la
-racine `Kael/` :
+racine `Projet_Drone_Gascogne/` :
 
 ```bash
-source env_drone/bin/activate
+source ../env_drone/bin/activate
 python -m prog_vol
 ```
 
@@ -106,7 +116,7 @@ premier transfert :
 3. fermer la vue d'édition de la mission ;
 4. brancher la radiocommande en USB ;
 5. choisir le mode Android de transfert de fichiers si la radio le demande ;
-6. lancer la détection depuis l'application Kael.
+6. lancer la détection depuis l'application Projet Drone Gascogne.
 
 La mission brouillon sert de cible. Son KMZ est sauvegardé puis remplacé, mais son
 nom et son emplacement restent ceux attendus par DJI Fly.
@@ -122,7 +132,32 @@ fenêtre.
 Si la recherche échoue, la carte reste utilisable et peut être déplacée
 manuellement.
 
-### 2. Régler les paramètres
+### 2. Utiliser les parcelles cadastrales de Gironde
+
+Le dessin libre reste disponible. Pour utiliser le cadastre :
+
+1. cliquer sur `Installer les données cadastrales` lors de la première utilisation ;
+2. attendre la fin du téléchargement et de l'indexation locale ;
+3. choisir `Sélection cadastrale` ;
+4. cliquer au centre d'une parcelle sur la carte, ou renseigner son code INSEE,
+   son préfixe éventuel, sa section et son numéro ;
+5. sélectionner d'autres parcelles adjacentes si nécessaire.
+
+Un second clic sur une parcelle déjà sélectionnée la retire. Les parcelles qui ne
+se touchent pas sont refusées dans cette première version afin de ne pas créer de
+transition de vol hors de la zone demandée. La contenance affichée vient du
+cadastre; elle est donnée en mètres carrés.
+
+La base SQLite est enregistrée sous macOS dans :
+
+```text
+~/Library/Application Support/Projet Drone Gascogne/cadastre/
+```
+
+Le fichier compressé est supprimé après l'indexation. Les données locales peuvent
+être remplacées avec le bouton `Mettre à jour les données cadastrales`.
+
+### 3. Régler les paramètres
 
 Les paramètres disponibles sont :
 
@@ -140,7 +175,7 @@ Les paramètres disponibles sont :
 Les recouvrements affichés en pourcentage sont convertis en nombres entre `0` et
 `1` avant le calcul.
 
-### 3. Dessiner la zone
+### 4. Dessiner librement la zone
 
 Cliquer sur la carte pour ajouter les sommets dans l'ordre du contour. Le tracé
 ne doit pas se croiser lui-même.
@@ -151,7 +186,7 @@ Après au moins trois sommets :
 2. vérifier visuellement la zone fermée ;
 3. utiliser `Réinitialiser` en cas d'erreur.
 
-### 4. Générer le KMZ
+### 5. Générer le KMZ
 
 Cliquer sur `Générer le fichier KMZ`, puis choisir son emplacement. La génération
 est réalisée en arrière-plan.
@@ -286,6 +321,7 @@ prog_vol/
 ├── __main__.py       point d'entrée de l'interface graphique
 ├── gui.py            fenêtre, onglets et workers QThread
 ├── map_widget.py     Leaflet, QWebEngineView et QWebChannel
+├── cadastre.py       téléchargement, SQLite/RTree et géométries cadastrales
 ├── generator.py      paramètres, trajectoire et export KMZ
 ├── missions.py       inspection et validation des archives
 ├── mtp.py            volumes montés, GIO/MTP et libmtp natif
@@ -333,10 +369,10 @@ transfert.
 
 ## Tests
 
-Depuis la racine `Kael/` avec l'environnement virtuel :
+Depuis `Projet_Drone_Gascogne/` avec l'environnement virtuel voisin :
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 env_drone/bin/python -m unittest discover -s prog_vol/tests -v
+PYTHONDONTWRITEBYTECODE=1 ../env_drone/bin/python -m unittest discover -s prog_vol/tests -v
 ```
 
 Les tests couvrent notamment :
@@ -352,6 +388,9 @@ Les tests couvrent notamment :
 - la détection de faux stockages ;
 - le tri et les chemins relatifs utilisés par l'interface ;
 - les chemins virtuels libmtp confinés.
+- l'indexation cadastrale sans réseau ;
+- la recherche par référence et par clic ;
+- la fusion des parcelles adjacentes et le refus des parcelles séparées.
 
 Les tests de transfert utilisent un faux stockage local et ne modifient pas une
 vraie radiocommande.
@@ -363,7 +402,7 @@ Sur une machine sans écran graphique :
 ```bash
 QT_QPA_PLATFORM=offscreen \
 QTWEBENGINE_DISABLE_SANDBOX=1 \
-env_drone/bin/python -c \
+../env_drone/bin/python -c \
 'from PyQt5.QtWidgets import QApplication; from prog_vol.gui import MainWindow; app=QApplication([]); window=MainWindow(); print(window.tabs.count()); window.close()'
 ```
 
@@ -401,6 +440,18 @@ depuis Internet.
 Utiliser une requête plus précise avec ville et pays, ou déplacer manuellement la
 carte. Nominatim peut aussi limiter temporairement les requêtes.
 
+### Les données cadastrales ne sont pas installées
+
+Cliquer sur `Installer les données cadastrales`, vérifier la connexion Internet
+et conserver au moins 3 Go libres pendant l'opération. L'installation utilise le
+fichier officiel des parcelles de Gironde publié sur cadastre.data.gouv.fr.
+
+### Une parcelle n'est pas trouvée au clic
+
+Zoomer et cliquer davantage au centre de la parcelle. Un clic posé exactement sur
+une limite peut correspondre à plusieurs parcelles. Pour la recherche textuelle,
+vérifier le code INSEE, la section, le numéro et, si nécessaire, le préfixe.
+
 ### Aucune radiocommande n'est détectée
 
 - vérifier le câble USB et le mode transfert de fichiers ;
@@ -426,7 +477,8 @@ la cible a été restaurée, puis ouvrir DJI Fly avant toute nouvelle tentative.
 
 ## Limites actuelles
 
-- pas encore de couche ni de sélection cadastrale ;
+- données cadastrales limitées au département de la Gironde ;
+- seules les parcelles adjacentes formant un polygone continu sans trou sont acceptées ;
 - carte et géocodage dépendants d'Internet ;
 - génération limitée à un balayage horizontal ;
 - modèle de drone WPML actuellement fixé à la valeur utilisée par le prototype ;
