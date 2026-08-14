@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
+from .autonomy import FlightEstimate, estimate_flight, geographic_distance_m
+
 
 MAX_WAYPOINTS = 20_000
 
@@ -26,6 +28,7 @@ class MissionParameters:
     sensor_width: float = 6.17
     sensor_height: float = 4.55
     focal_length: float = 4.5
+    photo_interval: float = 2.0
 
     def validate(self) -> None:
         if self.altitude <= 0:
@@ -46,6 +49,8 @@ class MissionParameters:
             raise GenerationError("Les dimensions du capteur doivent être positives.")
         if self.focal_length <= 0:
             raise GenerationError("La focale doit être strictement positive.")
+        if self.photo_interval <= 0:
+            raise GenerationError("L'intervalle minimal entre photos doit être positif.")
 
 
 @dataclass(frozen=True)
@@ -55,6 +60,7 @@ class GenerationResult:
     line_count: int
     fov_width: float
     fov_height: float
+    flight_estimate: FlightEstimate
 
     @property
     def waypoint_count(self) -> int:
@@ -87,12 +93,7 @@ def _bounding_box(
 
 
 def _distance_m(point_a: tuple[float, float], point_b: tuple[float, float]) -> float:
-    average_latitude = (point_a[0] + point_b[0]) / 2
-    dx = (point_b[1] - point_a[1]) * 111_000 * math.cos(
-        math.radians(average_latitude)
-    )
-    dy = (point_b[0] - point_a[0]) * 111_000
-    return math.hypot(dx, dy)
+    return geographic_distance_m(point_a, point_b)
 
 
 def _orientation(
@@ -225,11 +226,22 @@ def generate_waypointmap_kmz(
     waypoints: list[tuple[float, float, float]],
     parameters: MissionParameters,
     output_path: str | Path,
+    *,
+    route_distance_m: float | None = None,
+    route_duration_s: float | None = None,
 ) -> Path:
     """Crée l'archive WPMZ attendue par DJI Fly et WaypointMap."""
     parameters.validate()
     if not waypoints:
         raise GenerationError("Une mission KMZ doit contenir au moins un waypoint.")
+    if route_distance_m is None or route_duration_s is None:
+        route_estimate = estimate_flight(
+            waypoints,
+            parameters.drone_speed,
+            photo_interval_s=parameters.photo_interval,
+        )
+        route_distance_m = route_estimate.route_distance_m
+        route_duration_s = route_estimate.route_duration_s
     path = Path(output_path).expanduser().resolve()
     if path.suffix.casefold() != ".kmz":
         path = path.with_suffix(".kmz")
@@ -370,8 +382,8 @@ def generate_waypointmap_kmz(
 <wpml:templateId>0</wpml:templateId>
 <wpml:executeHeightMode>relativeToStartPoint</wpml:executeHeightMode>
 <wpml:waylineId>0</wpml:waylineId>
-<wpml:distance>0</wpml:distance>
-<wpml:duration>0</wpml:duration>
+<wpml:distance>{route_distance_m:.2f}</wpml:distance>
+<wpml:duration>{route_duration_s:.2f}</wpml:duration>
 <wpml:autoFlightSpeed>{parameters.drone_speed}</wpml:autoFlightSpeed>
 {''.join(placemarks)}
 </Folder>
@@ -392,17 +404,32 @@ def generate_mission(
     polygon_points: list[tuple[float, float]] | list[list[float]],
     parameters: MissionParameters,
     output_path: str | Path,
+    *,
+    home_point: tuple[float, float] | None = None,
 ) -> GenerationResult:
     """Point d'entrée stable utilisé par l'interface graphique."""
     waypoints, line_count, fov_width, fov_height = generate_waypoints_polygon(
         polygon_points,
         parameters,
     )
-    path = generate_waypointmap_kmz(waypoints, parameters, output_path)
+    flight_estimate = estimate_flight(
+        waypoints,
+        parameters.drone_speed,
+        home_point=home_point,
+        photo_interval_s=parameters.photo_interval,
+    )
+    path = generate_waypointmap_kmz(
+        waypoints,
+        parameters,
+        output_path,
+        route_distance_m=flight_estimate.route_distance_m,
+        route_duration_s=flight_estimate.route_duration_s,
+    )
     return GenerationResult(
         output_path=path,
         waypoints=tuple(waypoints),
         line_count=line_count,
         fov_width=fov_width,
         fov_height=fov_height,
+        flight_estimate=flight_estimate,
     )

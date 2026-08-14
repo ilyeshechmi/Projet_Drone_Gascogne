@@ -171,11 +171,37 @@ Les paramètres disponibles sont :
 | Largeur du capteur | calcul de l'empreinte au sol |
 | Hauteur du capteur | calcul de l'empreinte au sol |
 | Longueur focale | calcul de l'empreinte au sol |
+| Mode photo | intervalle minimal utilisé pour contrôler la cadence des prises de vue |
 
 Les recouvrements affichés en pourcentage sont convertis en nombres entre `0` et
 `1` avant le calcul.
 
-### 4. Dessiner librement la zone
+### 4. Déclarer le Home et les batteries
+
+Le point `Home` de décollage et de retour est facultatif et se place directement
+sur la carte. Lorsqu'il est présent, l'estimation inclut le transit aller-retour,
+la montée et la descente. Il est utilisé uniquement pour l'autonomie et ne change
+pas encore l'ordre ou l'orientation de la trajectoire.
+
+Une batterie `BWXNN3-2587-7.0` chargée à 100 % est proposée par défaut. Il est
+possible d'ajouter plusieurs batteries, de modifier leur charge ou de choisir un
+profil personnalisé. Les charges restent en mémoire pour la mission en cours et
+ne sont pas enregistrées sur le disque.
+
+Le profil par défaut utilise 21 minutes d'autonomie de référence et conserve par
+défaut 20 points de charge pour l'atterrissage. Une batterie à 50 % dispose donc
+de 30 % de sa durée de référence avant d'atteindre cette réserve. Pour une
+batterie personnalisée sans autonomie mesurée, la durée est extrapolée à partir
+des Wh et signalée comme moins fiable.
+
+Plusieurs batteries ne permettent pas d'exécuter un KMZ continu : changer de
+batterie impose un atterrissage et un découpage de la mission. Cette version
+affiche l'alerte mais ne réalise pas encore ce découpage.
+
+Les sources, hypothèses, formules et niveaux d'alerte sont détaillés dans
+[`AUTONOMIE_DRONE.md`](AUTONOMIE_DRONE.md).
+
+### 5. Dessiner librement la zone
 
 Cliquer sur la carte pour ajouter les sommets dans l'ordre du contour. Le tracé
 ne doit pas se croiser lui-même.
@@ -186,7 +212,7 @@ Après au moins trois sommets :
 2. vérifier visuellement la zone fermée ;
 3. utiliser `Réinitialiser` en cas d'erreur.
 
-### 5. Générer le KMZ
+### 6. Générer le KMZ
 
 Cliquer sur `Générer le fichier KMZ`, puis choisir son emplacement. La génération
 est réalisée en arrière-plan.
@@ -319,6 +345,7 @@ python -m prog_vol.main --help
 prog_vol/
 ├── __init__.py       API Python publique
 ├── __main__.py       point d'entrée de l'interface graphique
+├── autonomy.py       durée de vol, profils et alertes batterie
 ├── gui.py            fenêtre, onglets et workers QThread
 ├── map_widget.py     Leaflet, QWebEngineView et QWebChannel
 ├── cadastre.py       téléchargement, SQLite/RTree et géométries cadastrales
@@ -345,6 +372,14 @@ d'entrée suivant :
 from prog_vol.generator import MissionParameters, generate_mission
 
 result = generate_mission(polygon, parameters, output_path)
+
+# Le Home est facultatif et ne modifie pas la trajectoire.
+result = generate_mission(
+    polygon,
+    parameters,
+    output_path,
+    home_point=(44.8, -0.6),
+)
 ```
 
 Entrées :
@@ -360,6 +395,7 @@ Sortie :
 - `GenerationResult.line_count` ;
 - `GenerationResult.fov_width` ;
 - `GenerationResult.fov_height` ;
+- `GenerationResult.flight_estimate` ;
 - `GenerationResult.waypoint_count`.
 
 Pour remplacer l'algorithme sans toucher au transfert, conserver ce contrat ou
@@ -379,6 +415,9 @@ Les tests couvrent notamment :
 
 - la production d'un KMZ accepté par le validateur ;
 - les paramètres et polygones invalides ;
+- les distances, durées, profils batterie et réserves de sécurité ;
+- l'estimation complète avec Home et partielle sans Home ;
+- la détection d'une cadence photo trop rapide ;
 - le rejet d'un contour auto-intersecté ;
 - les protections contre les archives dangereuses ;
 - le `dry-run` ;
@@ -484,5 +523,9 @@ la cible a été restaurée, puis ouvrir DJI Fly avant toute nouvelle tentative.
 - modèle de drone WPML actuellement fixé à la valeur utilisée par le prototype ;
 - les zones concaves doivent être vérifiées avec une attention particulière car
   une liaison entre deux passes peut sortir brièvement du contour ;
-- aucun calcul d'obstacles, de relief, d'autonomie ou de réglementation ;
+- aucun calcul d'obstacles, de relief ou de réglementation ;
+- l'autonomie reste une estimation préalable : elle ne remplace pas les alertes
+  de DJI Fly ni la vérification de la météo et de l'état réel des batteries ;
+- le Home est pris en compte dans la durée mais n'optimise pas encore la trajectoire ;
+- le changement de batterie est signalé mais la mission n'est pas découpée automatiquement ;
 - la trajectoire doit être inspectée dans DJI Fly avant utilisation.

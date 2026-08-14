@@ -74,3 +74,15 @@ Traceback (most recent call last):
   File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/prog_vol/gui.py", line 114, in work
     raise GenerationError(f"Lieu introuvable : {self.place}")
 prog_vol.generator.GenerationError: Lieu introuvable : parc de peixotto
+2026-08-14 15:02:28,823 | ERROR | Échec d'une opération graphique
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/prog_vol/gui.py", line 122, in run
+    self.succeeded.emit(self.work())
+                        ~~~~~~~~~^^
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/prog_vol/gui.py", line 226, in work
+    storage = detect_storage()
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/prog_vol/mtp.py", line 1031, in detect_storage
+    raise StorageError(
+    ...<2 lines>...
+    )
+prog_vol.mtp.StorageError: Aucun stockage DJI Fly accessible. Branchez la radiocommande en mode transfert de fichiers, installez libmtp, ou indiquez --device-root / --mtp-uri.

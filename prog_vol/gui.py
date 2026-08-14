@@ -35,6 +35,15 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from .autonomy import (
+    AlertLevel,
+    AutonomyError,
+    BatteryAssessment,
+    BatteryState,
+    DEFAULT_BATTERY_PROFILE,
+    assess_batteries,
+    custom_battery_profile,
+)
 from .cadastre import (
     CadastreGironde,
     ErreurCadastre,
@@ -74,10 +83,26 @@ def human_size(size: int) -> str:
     return f"{size} o"
 
 
+def human_duration(seconds: float) -> str:
+    total = max(0, round(seconds))
+    minutes, remaining_seconds = divmod(total, 60)
+    if minutes:
+        return f"{minutes} min {remaining_seconds:02d} s"
+    return f"{remaining_seconds} s"
+
+
 def friendly_error(exc: Exception) -> str:
     if isinstance(
         exc,
-        (ErreurCadastre, GenerationError, MissionError, StorageError, TransferError, OSError),
+        (
+            AutonomyError,
+            ErreurCadastre,
+            GenerationError,
+            MissionError,
+            StorageError,
+            TransferError,
+            OSError,
+        ),
     ):
         return str(exc)
     return "Une erreur inattendue est survenue. Consultez le journal de l'application."
@@ -130,15 +155,31 @@ class GenerationWorker(Worker):
         points: list[tuple[float, float]],
         parameters: MissionParameters,
         output_path: Path,
+        home_point: tuple[float, float] | None,
+        batteries: tuple[BatteryState, ...],
+        reserve_percent: float,
     ) -> None:
         super().__init__()
         self.points = points
         self.parameters = parameters
         self.output_path = output_path
+        self.home_point = home_point
+        self.batteries = batteries
+        self.reserve_percent = reserve_percent
 
-    def work(self) -> tuple[GenerationResult, MissionArchive]:
-        result = generate_mission(self.points, self.parameters, self.output_path)
-        return result, inspect_mission(result.output_path)
+    def work(self) -> tuple[GenerationResult, MissionArchive, BatteryAssessment]:
+        result = generate_mission(
+            self.points,
+            self.parameters,
+            self.output_path,
+            home_point=self.home_point,
+        )
+        assessment = assess_batteries(
+            result.flight_estimate,
+            self.batteries,
+            self.reserve_percent,
+        )
+        return result, inspect_mission(result.output_path), assessment
 
 
 class InstallationCadastreWorker(Worker):
@@ -331,8 +372,135 @@ class ThreadedPanel(QWidget):
         self.set_busy(False)
 
 
+class BatteryRowWidget(QFrame):
+    """Saisie temporaire d'une batterie disponible pour la mission."""
+
+    remove_requested = pyqtSignal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("batteryCard")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 9, 10, 9)
+        layout.setSpacing(7)
+
+        header = QHBoxLayout()
+        self.title = QLabel("Batterie")
+        self.title.setObjectName("sectionTitle")
+        self.remove_button = QPushButton("Supprimer")
+        self.remove_button.clicked.connect(lambda: self.remove_requested.emit(self))
+        header.addWidget(self.title)
+        header.addStretch()
+        header.addWidget(self.remove_button)
+        layout.addLayout(header)
+
+        form = QFormLayout()
+        form.setSpacing(6)
+        self.model = QComboBox()
+        self.model.addItem(
+            f"{DEFAULT_BATTERY_PROFILE.model} - "
+            f"{DEFAULT_BATTERY_PROFILE.capacity_mah:.0f} mAh",
+            "default",
+        )
+        self.model.addItem("Batterie personnalisée...", "custom")
+        self.model.currentIndexChanged.connect(self._profile_changed)
+        form.addRow("Modèle", self.model)
+
+        self.custom_name = QLineEdit("Batterie personnalisée")
+        form.addRow("Nom", self.custom_name)
+        self.capacity = QDoubleSpinBox()
+        self.capacity.setRange(1, 50_000)
+        self.capacity.setDecimals(0)
+        self.capacity.setSuffix(" mAh")
+        self.capacity.setValue(DEFAULT_BATTERY_PROFILE.capacity_mah)
+        form.addRow("Capacité", self.capacity)
+        self.voltage = QDoubleSpinBox()
+        self.voltage.setRange(0.1, 100)
+        self.voltage.setDecimals(2)
+        self.voltage.setSuffix(" V")
+        self.voltage.setValue(DEFAULT_BATTERY_PROFILE.nominal_voltage_v)
+        form.addRow("Tension", self.voltage)
+        self.reference_minutes = QDoubleSpinBox()
+        self.reference_minutes.setRange(0, 180)
+        self.reference_minutes.setDecimals(1)
+        self.reference_minutes.setSuffix(" min")
+        self.reference_minutes.setSpecialValueText("Auto selon les Wh")
+        self.reference_minutes.setValue(0)
+        form.addRow("Autonomie mesurée", self.reference_minutes)
+        self.charge = QDoubleSpinBox()
+        self.charge.setRange(0, 100)
+        self.charge.setDecimals(0)
+        self.charge.setSuffix(" %")
+        self.charge.setValue(100)
+        form.addRow("Charge", self.charge)
+        layout.addLayout(form)
+
+        self.energy_label = QLabel()
+        self.energy_label.setObjectName("mutedSmall")
+        layout.addWidget(self.energy_label)
+        self.capacity.valueChanged.connect(self._update_energy)
+        self.voltage.valueChanged.connect(self._update_energy)
+        self.reference_minutes.valueChanged.connect(self._update_energy)
+        self._profile_changed()
+
+    def set_number(self, number: int) -> None:
+        self.title.setText(f"Batterie {number}")
+
+    def _profile_changed(self, *_args) -> None:
+        custom = self.model.currentData() == "custom"
+        for widget in (
+            self.custom_name,
+            self.capacity,
+            self.voltage,
+            self.reference_minutes,
+        ):
+            widget.setEnabled(custom)
+        if not custom:
+            self.capacity.setValue(DEFAULT_BATTERY_PROFILE.capacity_mah)
+            self.voltage.setValue(DEFAULT_BATTERY_PROFILE.nominal_voltage_v)
+        self._update_energy()
+
+    def _update_energy(self, *_args) -> None:
+        if self.model.currentData() == "default":
+            energy = DEFAULT_BATTERY_PROFILE.effective_energy_wh
+            reference = DEFAULT_BATTERY_PROFILE.reference_flight_time_s / 60
+            self.energy_label.setText(
+                f"Énergie : {energy:.1f} Wh • autonomie de référence : {reference:.0f} min"
+            )
+            return
+        energy = self.capacity.value() * self.voltage.value() / 1000
+        if self.reference_minutes.value() > 0:
+            reference = f"{self.reference_minutes.value():.1f} min mesurées"
+        else:
+            estimated = (
+                DEFAULT_BATTERY_PROFILE.reference_flight_time_s
+                * energy
+                / DEFAULT_BATTERY_PROFILE.effective_energy_wh
+                / 60
+            )
+            reference = f"environ {estimated:.1f} min par extrapolation"
+        self.energy_label.setText(f"Énergie calculée : {energy:.2f} Wh • {reference}")
+
+    def battery_state(self, number: int) -> BatteryState:
+        if self.model.currentData() == "default":
+            profile = DEFAULT_BATTERY_PROFILE
+        else:
+            reference = self.reference_minutes.value()
+            profile = custom_battery_profile(
+                self.custom_name.text().strip(),
+                self.capacity.value(),
+                self.voltage.value(),
+                reference * 60 if reference > 0 else None,
+            )
+        return BatteryState(
+            name=f"Batterie {number}",
+            profile=profile,
+            charge_percent=self.charge.value(),
+        )
+
+
 class GenerationTab(ThreadedPanel):
-    mission_generated = pyqtSignal(object, object)
+    mission_generated = pyqtSignal(object, object, object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -465,6 +633,9 @@ class GenerationTab(ThreadedPanel):
         self.sensor_width = self._spin(0.1, 100, 6.17, 2, " mm", 0.1)
         self.sensor_height = self._spin(0.1, 100, 4.55, 2, " mm", 0.1)
         self.focal_length = self._spin(0.1, 200, 4.5, 2, " mm", 0.1)
+        self.photo_mode = QComboBox()
+        self.photo_mode.addItem("Cadence supposée 12 MP - 2 s", 2.0)
+        self.photo_mode.addItem("Cadence supposée 50 MP - 5 s", 5.0)
         for label, widget in (
             ("Altitude", self.altitude),
             ("Vitesse", self.speed),
@@ -474,9 +645,34 @@ class GenerationTab(ThreadedPanel):
             ("Largeur du capteur", self.sensor_width),
             ("Hauteur du capteur", self.sensor_height),
             ("Longueur focale", self.focal_length),
+            ("Contrôle photo", self.photo_mode),
         ):
             form.addRow(label, widget)
         controls_layout.addLayout(form)
+
+        controls_layout.addWidget(self._section_label("Batteries de cette mission"))
+        battery_note = QLabel(
+            "Les charges sont temporaires et ne sont pas enregistrées. Une mission "
+            "continue doit tenir sur une seule batterie."
+        )
+        battery_note.setObjectName("mutedSmall")
+        battery_note.setWordWrap(True)
+        controls_layout.addWidget(battery_note)
+        self.battery_rows: list[BatteryRowWidget] = []
+        self.battery_container = QWidget()
+        self.battery_layout = QVBoxLayout(self.battery_container)
+        self.battery_layout.setContentsMargins(0, 0, 0, 0)
+        self.battery_layout.setSpacing(7)
+        controls_layout.addWidget(self.battery_container)
+        self.add_battery_button = QPushButton("Ajouter une batterie")
+        self.add_battery_button.setObjectName("secondaryButton")
+        self.add_battery_button.clicked.connect(self.add_battery)
+        controls_layout.addWidget(self.add_battery_button)
+        reserve_form = QFormLayout()
+        self.reserve = self._spin(0, 80, 20, 0, " %", 5)
+        reserve_form.addRow("Charge réservée à l'atterrissage", self.reserve)
+        controls_layout.addLayout(reserve_form)
+        self.add_battery()
 
         controls_layout.addWidget(self._section_label("Zone de mission"))
         self.point_status = QLabel("Aucun sommet placé.")
@@ -491,6 +687,21 @@ class GenerationTab(ThreadedPanel):
         polygon_buttons.addWidget(self.close_button)
         polygon_buttons.addWidget(self.reset_button)
         controls_layout.addLayout(polygon_buttons)
+
+        self.home_status = QLabel(
+            "Home non défini : l'estimation d'autonomie sera partielle."
+        )
+        self.home_status.setObjectName("mutedSmall")
+        self.home_status.setWordWrap(True)
+        controls_layout.addWidget(self.home_status)
+        home_buttons = QHBoxLayout()
+        self.place_home_button = QPushButton("Placer le point Home")
+        self.place_home_button.clicked.connect(self.place_home)
+        self.clear_home_button = QPushButton("Supprimer Home")
+        self.clear_home_button.setEnabled(False)
+        home_buttons.addWidget(self.place_home_button)
+        home_buttons.addWidget(self.clear_home_button)
+        controls_layout.addLayout(home_buttons)
 
         self.generate_button = QPushButton("Générer le fichier KMZ")
         self.generate_button.setObjectName("primaryButton")
@@ -511,6 +722,8 @@ class GenerationTab(ThreadedPanel):
         self.map_widget.polygon_changed.connect(self.polygon_changed)
         self.map_widget.polygon_closed_changed.connect(self.polygon_closed_changed)
         self.map_widget.parcelle_demandee.connect(self.selectionner_parcelle_sur_carte)
+        self.map_widget.home_changed.connect(self.home_changed)
+        self.clear_home_button.clicked.connect(self.map_widget.clear_home)
         self.mode_zone.currentIndexChanged.connect(self.changer_mode_zone)
         splitter.addWidget(controls_scroll)
         splitter.addWidget(self.map_widget)
@@ -523,6 +736,44 @@ class GenerationTab(ThreadedPanel):
         label.setObjectName("sectionTitle")
         return label
 
+    def add_battery(self) -> None:
+        row = BatteryRowWidget()
+        row.remove_requested.connect(self.remove_battery)
+        self.battery_rows.append(row)
+        self.battery_layout.addWidget(row)
+        self._refresh_battery_rows()
+
+    @pyqtSlot(object)
+    def remove_battery(self, row: object) -> None:
+        if len(self.battery_rows) <= 1 or row not in self.battery_rows:
+            return
+        self.battery_rows.remove(row)
+        self.battery_layout.removeWidget(row)
+        row.deleteLater()
+        self._refresh_battery_rows()
+
+    def reset_batteries(self) -> None:
+        for row in self.battery_rows:
+            self.battery_layout.removeWidget(row)
+            row.deleteLater()
+        self.battery_rows.clear()
+        self.add_battery()
+        self.reserve.setValue(20)
+
+    def _refresh_battery_rows(self) -> None:
+        for number, row in enumerate(self.battery_rows, start=1):
+            row.set_number(number)
+            row.remove_button.setEnabled(len(self.battery_rows) > 1 and not self.busy)
+
+    def battery_states(self) -> tuple[BatteryState, ...]:
+        states = tuple(
+            row.battery_state(number)
+            for number, row in enumerate(self.battery_rows, start=1)
+        )
+        for state in states:
+            state.validate()
+        return states
+
     def parameters(self) -> MissionParameters:
         return MissionParameters(
             altitude=self.altitude.value(),
@@ -533,7 +784,29 @@ class GenerationTab(ThreadedPanel):
             sensor_width=self.sensor_width.value(),
             sensor_height=self.sensor_height.value(),
             focal_length=self.focal_length.value(),
+            photo_interval=float(self.photo_mode.currentData()),
         )
+
+    def place_home(self) -> None:
+        self.map_widget.begin_home_placement()
+        self.home_status.setText(
+            "Cliquez sur la carte pour placer le point de décollage et de retour."
+        )
+
+    @pyqtSlot(object)
+    def home_changed(self, point: object) -> None:
+        if point is None:
+            self.home_status.setText(
+                "Home non défini : l'estimation d'autonomie sera partielle."
+            )
+            self.clear_home_button.setEnabled(False)
+            return
+        latitude, longitude = point
+        self.home_status.setText(
+            f"Home : {latitude:.6f}, {longitude:.6f}. "
+            "Utilisé pour l'estimation uniquement, sans modifier la trajectoire."
+        )
+        self.clear_home_button.setEnabled(not self.busy)
 
     def locate(self) -> None:
         place = self.place_input.text().strip()
@@ -599,6 +872,7 @@ class GenerationTab(ThreadedPanel):
         self.parcelles_selectionnees.clear()
         self.parcelles_list.clear()
         self.map_widget.reset()
+        self.reset_batteries()
         self.map_widget.set_mode_selection(self.mode_zone.currentIndex() == 1)
         self.parcelles_status.setText("Aucune parcelle cadastrale sélectionnée.")
         self.result_label.setText("La mission générée sera résumée ici.")
@@ -625,6 +899,7 @@ class GenerationTab(ThreadedPanel):
         self.parcelles_selectionnees.clear()
         self.parcelles_list.clear()
         self.map_widget.reset()
+        self.reset_batteries()
         self.map_widget.set_mode_selection(cadastral)
         self.parcelles_status.setText("Aucune parcelle cadastrale sélectionnée.")
         self.result_label.setText("La mission générée sera résumée ici.")
@@ -758,6 +1033,7 @@ class GenerationTab(ThreadedPanel):
         self.parcelles_list.clear()
         self.parcelles_status.setText("Aucune parcelle cadastrale sélectionnée.")
         self.map_widget.reset()
+        self.reset_batteries()
         self.map_widget.set_mode_selection(self.mode_zone.currentIndex() == 1)
         self.result_label.setText("La mission générée sera résumée ici.")
 
@@ -773,32 +1049,95 @@ class GenerationTab(ThreadedPanel):
             self.generate_to(Path(selected))
 
     def generate_to(self, output_path: Path) -> None:
+        try:
+            batteries = self.battery_states()
+        except AutonomyError as exc:
+            QMessageBox.warning(self, "Batteries", str(exc))
+            return
         self.result_label.setText("Calcul de la trajectoire et création du KMZ...")
         self.start_worker(
             GenerationWorker(
                 list(self.map_widget.points),
                 self.parameters(),
                 output_path,
+                self.map_widget.home_point,
+                batteries,
+                self.reserve.value(),
             ),
             self.generation_completed,
         )
 
     @pyqtSlot(object)
     def generation_completed(self, payload: object) -> None:
-        result, archive = payload
+        result, archive, assessment = payload
+        estimate = result.flight_estimate
         self.map_widget.show_waypoints(result.waypoints)
-        self.result_label.setText(
+        distance_line = f"Distance dans la zone : {estimate.route_distance_m / 1000:.2f} km"
+        if estimate.transit_distance_m is not None:
+            distance_line += f" • transit : {estimate.transit_distance_m / 1000:.2f} km"
+        else:
+            distance_line += " • transit non calculé"
+        alert_names = {
+            AlertLevel.OK: "AUTONOMIE OK",
+            AlertLevel.WARNING: "AVERTISSEMENT AUTONOMIE",
+            AlertLevel.CRITICAL: "CHARGE INSUFFISANTE",
+            AlertLevel.PARTIAL: "ESTIMATION PARTIELLE",
+        }
+        details = [
             f"Mission prête : {result.waypoint_count} waypoints sur "
-            f"{result.line_count} passe(s).\n"
-            f"FOV : {result.fov_width:.1f} × {result.fov_height:.1f} m\n"
-            f"Fichier : {result.output_path}"
+            f"{result.line_count} passe(s), {estimate.photo_count} photos prévues.",
+            distance_line,
+            f"Durée estimée : {human_duration(estimate.estimated_duration_s)}",
+            f"{alert_names[assessment.level]} : {assessment.message}",
+        ]
+        if assessment.recommended_battery is not None:
+            battery = assessment.recommended_battery
+            details.append(
+                f"Batterie recommandée : {battery.name}, {battery.charge_percent:.0f} % "
+                f"({battery.profile.model})"
+            )
+        if assessment.margin_s is not None:
+            margin_label = "Marge sûre" if assessment.margin_s >= 0 else "Déficit"
+            details.append(f"{margin_label} : {human_duration(abs(assessment.margin_s))}")
+        if estimate.short_photo_intervals:
+            details.append(
+                f"Cadence photo : {estimate.short_photo_intervals} segment(s) trop courts "
+                "pour l'intervalle choisi."
+            )
+        if assessment.estimated_profile_used:
+            details.append(
+                "Une autonomie de batterie personnalisée a été extrapolée depuis les Wh."
+            )
+        details.extend(
+            (
+                f"FOV : {result.fov_width:.1f} × {result.fov_height:.1f} m",
+                f"Fichier : {result.output_path}",
+            )
         )
-        self.mission_generated.emit(result.output_path, archive)
-        QMessageBox.information(
+        self.result_label.setText("\n".join(details))
+        self.mission_generated.emit(result, archive, assessment)
+        cadence_note = ""
+        if estimate.short_photo_intervals:
+            cadence_note = (
+                f"\n\nAttention : {estimate.short_photo_intervals} intervalle(s) photo "
+                "sont trop courts. Le choix indique une cadence supposée et ne configure "
+                "pas la résolution de la caméra dans le KMZ."
+            )
+        dialog_text = (
+            f"Le KMZ a été généré et validé avec {archive.waypoint_count} waypoints.\n\n"
+            f"{assessment.message}{cadence_note}\n\n"
+            "Il est maintenant sélectionné dans l'onglet Radiocommande et transfert."
+        )
+        dialog = {
+            AlertLevel.OK: QMessageBox.information,
+            AlertLevel.WARNING: QMessageBox.warning,
+            AlertLevel.CRITICAL: QMessageBox.critical,
+            AlertLevel.PARTIAL: QMessageBox.warning,
+        }[assessment.level]
+        dialog(
             self,
             "Mission générée",
-            f"Le KMZ a été généré et validé avec {archive.waypoint_count} waypoints.\n\n"
-            "Il est maintenant sélectionné dans l'onglet Radiocommande et transfert.",
+            dialog_text,
         )
 
     def set_busy(self, busy: bool) -> None:
@@ -812,6 +1151,14 @@ class GenerationTab(ThreadedPanel):
         self.generate_button.setEnabled(not busy and self.map_widget.is_closed)
         self.install_cadastre_button.setEnabled(not busy)
         self.mode_zone.setEnabled(not busy)
+        self.add_battery_button.setEnabled(not busy)
+        self.reserve.setEnabled(not busy)
+        self.photo_mode.setEnabled(not busy)
+        self.place_home_button.setEnabled(not busy)
+        self.clear_home_button.setEnabled(not busy and self.map_widget.home_point is not None)
+        for row in self.battery_rows:
+            row.setEnabled(not busy)
+        self._refresh_battery_rows()
         cadastral_disponible = (
             not busy and self.mode_zone.currentIndex() == 1 and self.cadastre.est_installe
         )
@@ -843,6 +1190,8 @@ class TransferTab(ThreadedPanel):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.source_archive: MissionArchive | None = None
+        self.source_assessment: BatteryAssessment | None = None
+        self.source_cadence_warning: str | None = None
         self.detection: DetectionResult | None = None
         self.refresh_after_task = False
         self._build_ui()
@@ -997,18 +1346,40 @@ class TransferTab(ThreadedPanel):
         self.progress_label.setText("")
         self.set_source_archive(archive)
 
-    @pyqtSlot(object, object)
-    def set_generated_source(self, path: object, archive: object) -> None:
-        del path
-        self.set_source_archive(archive)
+    @pyqtSlot(object, object, object)
+    def set_generated_source(
+        self, result: object, archive: object, assessment: object
+    ) -> None:
+        short_intervals = result.flight_estimate.short_photo_intervals
+        cadence_warning = None
+        if short_intervals:
+            cadence_warning = (
+                f"{short_intervals} intervalle(s) photo sont trop courts pour la "
+                "cadence supposée."
+            )
+        self.set_source_archive(archive, assessment, cadence_warning)
 
-    def set_source_archive(self, archive: MissionArchive) -> None:
+    def set_source_archive(
+        self,
+        archive: MissionArchive,
+        assessment: BatteryAssessment | None = None,
+        cadence_warning: str | None = None,
+    ) -> None:
         self.source_archive = archive
+        self.source_assessment = assessment
+        self.source_cadence_warning = cadence_warning
         self.source_label.setText(str(archive.path))
-        self.source_info.setText(
+        information = (
             f"{archive.waypoint_count} waypoints   •   {human_size(archive.size)}   •   "
             f"SHA-256 {archive.sha256[:16]}…"
         )
+        if assessment is None:
+            information += "\nAutonomie non évaluée pour ce fichier sélectionné manuellement."
+        else:
+            information += f"\nAutonomie : {assessment.message}"
+        if cadence_warning:
+            information += f"\nCadence photo : {cadence_warning}"
+        self.source_info.setText(information)
         self.update_transfer_button()
 
     def selected_mission(self) -> DetectedMission | None:
@@ -1026,6 +1397,28 @@ class TransferTab(ThreadedPanel):
         mission = self.selected_mission()
         if not self.source_archive or not mission:
             return
+        if (
+            self.source_assessment is not None
+            and self.source_assessment.level is AlertLevel.CRITICAL
+        ):
+            unsafe_answer = QMessageBox.warning(
+                self,
+                "Autonomie critique",
+                f"{self.source_assessment.message}\n\n"
+                "Le transfert de cette mission est déconseillé. Confirmez-vous que vous "
+                "souhaitez malgré tout poursuivre vers l'étape de remplacement ?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if unsafe_answer != QMessageBox.Yes:
+                return
+        autonomy_note = ""
+        if self.source_assessment is None:
+            autonomy_note = "\nAutonomie : non évaluée.\n"
+        elif self.source_assessment.level is not AlertLevel.OK:
+            autonomy_note = f"\nAutonomie : {self.source_assessment.message}\n"
+        if self.source_cadence_warning:
+            autonomy_note += f"\nCadence photo : {self.source_cadence_warning}\n"
         answer = QMessageBox.question(
             self,
             "Confirmer le remplacement",
@@ -1033,6 +1426,7 @@ class TransferTab(ThreadedPanel):
             f"Source : {self.source_archive.path}\n"
             f"Waypoints : {self.source_archive.waypoint_count}\n"
             f"Cible : {mission.relative_target}\n\n"
+            f"{autonomy_note}"
             "L'ancienne mission sera sauvegardée localement avant toute modification.\n"
             "Continuer ?",
             QMessageBox.Yes | QMessageBox.No,
@@ -1124,7 +1518,8 @@ class MainWindow(QMainWindow):
             QLabel#connectionOffline { color: #aa4a41; font-weight: 700; }
             QLabel#resultBox { background: #e4eceb; border-radius: 8px; padding: 11px; }
             QWidget#controlsPanel, QFrame#card { background: #ffffff; border: 1px solid #d7dfde; border-radius: 10px; }
-            QLineEdit, QDoubleSpinBox { background: white; border: 1px solid #bdc9c8; border-radius: 6px; padding: 6px; }
+            QFrame#batteryCard { background: #f8faf9; border: 1px solid #d7dfde; border-radius: 8px; }
+            QLineEdit, QDoubleSpinBox, QComboBox { background: white; border: 1px solid #bdc9c8; border-radius: 6px; padding: 6px; }
             QListWidget { background: #ffffff; border: 1px solid #d2dcda; border-radius: 9px; padding: 7px; }
             QListWidget::item { border-bottom: 1px solid #e8edec; padding: 10px 8px; }
             QListWidget::item:selected { background: #d9edf0; color: #173b48; }

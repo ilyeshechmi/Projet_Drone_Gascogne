@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from prog_vol.generator import (
@@ -39,6 +40,8 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(archive.waypoint_count, result.waypoint_count)
         self.assertGreater(result.fov_width, 0)
         self.assertGreater(result.fov_height, 0)
+        self.assertGreater(result.flight_estimate.route_distance_m, 0)
+        self.assertGreater(result.flight_estimate.route_duration_s, 0)
 
     def test_output_extension_is_added(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -76,6 +79,41 @@ class GenerationTests(unittest.TestCase):
                 ],
                 MissionParameters(),
             )
+
+    def test_home_is_included_in_estimate_without_changing_waypoints(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            without_home = generate_mission(
+                POLYGON,
+                MissionParameters(frontal_overlap=0.6, lateral_overlap=0.6),
+                Path(directory) / "without-home.kmz",
+            )
+            with_home = generate_mission(
+                POLYGON,
+                MissionParameters(frontal_overlap=0.6, lateral_overlap=0.6),
+                Path(directory) / "with-home.kmz",
+                home_point=(44.7995, -0.6005),
+            )
+
+        self.assertEqual(without_home.waypoints, with_home.waypoints)
+        self.assertFalse(without_home.flight_estimate.complete)
+        self.assertTrue(with_home.flight_estimate.complete)
+        self.assertGreater(
+            with_home.flight_estimate.estimated_duration_s,
+            without_home.flight_estimate.estimated_duration_s,
+        )
+
+    def test_wpml_contains_computed_distance_and_duration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = generate_mission(
+                POLYGON,
+                MissionParameters(frontal_overlap=0.6, lateral_overlap=0.6),
+                Path(directory) / "metrics.kmz",
+            )
+            with zipfile.ZipFile(result.output_path) as archive:
+                waylines = archive.read("wpmz/waylines.wpml").decode("utf-8")
+
+        self.assertNotIn("<wpml:distance>0</wpml:distance>", waylines)
+        self.assertNotIn("<wpml:duration>0</wpml:duration>", waylines)
 
 
 if __name__ == "__main__":

@@ -60,6 +60,8 @@ MAP_HTML = """<!DOCTYPE html>
     let bridge = null;
     let modeSelection = 'dessin';
     let interactionActive = true;
+    let homePlacement = false;
+    let homeMarker = null;
     let points = [];
     let pointMarkers = [];
     let outline = null;
@@ -83,6 +85,10 @@ MAP_HTML = """<!DOCTYPE html>
 
     function updateHint() {
       const hint = document.getElementById('hint');
+      if (homePlacement) {
+        hint.textContent = 'Cliquez sur la carte pour placer le point de décollage et de retour.';
+        return;
+      }
       if (modeSelection === 'cadastre') {
         hint.textContent = 'Mode cadastral : cliquez au centre d’une parcelle de Gironde.';
         return;
@@ -108,6 +114,17 @@ MAP_HTML = """<!DOCTYPE html>
 
     map.on('click', function(event) {
       if (!bridge || !interactionActive) return;
+      if (homePlacement) {
+        const point = [event.latlng.lat, event.latlng.lng];
+        if (homeMarker) map.removeLayer(homeMarker);
+        homeMarker = L.circleMarker(point, {
+          radius: 8, color: '#7b3f00', fillColor: '#f4a340', fillOpacity: 1, weight: 3
+        }).addTo(map).bindTooltip('Home : décollage et retour');
+        homePlacement = false;
+        updateHint();
+        bridge.setHome(point[0], point[1]);
+        return;
+      }
       if (modeSelection === 'cadastre') {
         bridge.selectionnerParcelle(event.latlng.lat, event.latlng.lng);
         return;
@@ -137,6 +154,7 @@ MAP_HTML = """<!DOCTYPE html>
       },
       setModeSelection: function(mode) {
         modeSelection = mode === 'cadastre' ? 'cadastre' : 'dessin';
+        homePlacement = false;
         if (modeSelection === 'cadastre' && !map.hasLayer(coucheCadastre)) {
           coucheCadastre.addTo(map);
         }
@@ -144,6 +162,16 @@ MAP_HTML = """<!DOCTYPE html>
       },
       setInteractionActive: function(active) {
         interactionActive = Boolean(active);
+      },
+      setHomePlacement: function(active) {
+        homePlacement = Boolean(active);
+        updateHint();
+      },
+      clearHome: function() {
+        homePlacement = false;
+        if (homeMarker) map.removeLayer(homeMarker);
+        homeMarker = null;
+        updateHint();
       },
       setMissionPolygon: function(coordinates) {
         pointMarkers.forEach(marker => map.removeLayer(marker));
@@ -169,6 +197,9 @@ MAP_HTML = """<!DOCTYPE html>
         outline = null;
         waypointLayer.clearLayers();
         parcellesSelectionnees.clearLayers();
+        if (homeMarker) map.removeLayer(homeMarker);
+        homeMarker = null;
+        homePlacement = false;
         updateHint();
       },
       showWaypoints: function(coordinates) {
@@ -193,6 +224,7 @@ MAP_HTML = """<!DOCTYPE html>
 class MapBridge(QObject):
     point_added = pyqtSignal(float, float)
     parcelle_demandee = pyqtSignal(float, float)
+    home_selected = pyqtSignal(float, float)
 
     @pyqtSlot(float, float)
     def addPoint(self, latitude: float, longitude: float) -> None:
@@ -202,22 +234,29 @@ class MapBridge(QObject):
     def selectionnerParcelle(self, latitude: float, longitude: float) -> None:
         self.parcelle_demandee.emit(latitude, longitude)
 
+    @pyqtSlot(float, float)
+    def setHome(self, latitude: float, longitude: float) -> None:
+        self.home_selected.emit(latitude, longitude)
+
 
 class MissionMapWidget(QWidget):
     polygon_changed = pyqtSignal(object)
     polygon_closed_changed = pyqtSignal(bool)
     parcelle_demandee = pyqtSignal(float, float)
+    home_changed = pyqtSignal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._points: list[tuple[float, float]] = []
         self._closed = False
+        self._home_point: tuple[float, float] | None = None
         self._loaded = False
         self._pending_scripts: list[str] = []
         self.view = QWebEngineView(self)
         self.bridge = MapBridge(self)
         self.bridge.point_added.connect(self._point_added)
         self.bridge.parcelle_demandee.connect(self.parcelle_demandee)
+        self.bridge.home_selected.connect(self._home_selected)
         self.channel = QWebChannel(self.view.page())
         self.channel.registerObject("bridge", self.bridge)
         self.view.page().setWebChannel(self.channel)
@@ -235,6 +274,10 @@ class MissionMapWidget(QWidget):
     @property
     def is_closed(self) -> bool:
         return self._closed
+
+    @property
+    def home_point(self) -> tuple[float, float] | None:
+        return self._home_point
 
     @pyqtSlot(float, float)
     def _point_added(self, latitude: float, longitude: float) -> None:
@@ -254,9 +297,11 @@ class MissionMapWidget(QWidget):
     def reset(self) -> None:
         self._points.clear()
         self._closed = False
+        self._home_point = None
         self._run_script("window.kaelMap.reset();")
         self.polygon_changed.emit(self.points)
         self.polygon_closed_changed.emit(False)
+        self.home_changed.emit(None)
 
     def set_center(self, latitude: float, longitude: float, zoom: int = 16) -> None:
         script = f"window.kaelMap.setCenter({float(latitude)}, {float(longitude)}, {int(zoom)});"
@@ -265,6 +310,19 @@ class MissionMapWidget(QWidget):
     def set_mode_selection(self, cadastral: bool) -> None:
         mode = "cadastre" if cadastral else "dessin"
         self._run_script(f"window.kaelMap.setModeSelection('{mode}');")
+
+    def begin_home_placement(self) -> None:
+        self._run_script("window.kaelMap.setHomePlacement(true);")
+
+    def clear_home(self) -> None:
+        self._home_point = None
+        self._run_script("window.kaelMap.clearHome();")
+        self.home_changed.emit(None)
+
+    @pyqtSlot(float, float)
+    def _home_selected(self, latitude: float, longitude: float) -> None:
+        self._home_point = (float(latitude), float(longitude))
+        self.home_changed.emit(self._home_point)
 
     def set_interaction_active(self, active: bool) -> None:
         valeur = "true" if active else "false"
