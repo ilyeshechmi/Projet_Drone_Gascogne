@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 
 
 DEFAULT_RESERVE_PERCENT = 20.0
 DEFAULT_VERTICAL_SPEED_MPS = 3.0
+MAX_SPLIT_BATTERIES = 12
 
 
 class AutonomyError(ValueError):
@@ -141,6 +144,39 @@ class BatteryAssessment:
     estimated_profile_used: bool
 
 
+@dataclass(frozen=True)
+class MissionPart:
+    """Sous-mission contiguë affectée à une batterie physique."""
+
+    start_index: int
+    end_index: int
+    waypoints: tuple[tuple[float, float, float], ...]
+    battery: BatteryState
+    flight_estimate: FlightEstimate
+    safe_time_s: float
+    margin_s: float
+    ends_on_pass_boundary: bool
+
+    @property
+    def waypoint_count(self) -> int:
+        return self.end_index - self.start_index
+
+
+@dataclass(frozen=True)
+class MissionSplitPlan:
+    """Résultat d'une recherche de découpage, réalisable ou expliquée."""
+
+    original_estimate: FlightEstimate
+    parts: tuple[MissionPart, ...]
+    possible: bool
+    reason: str
+    uses_mid_pass_cut: bool = False
+
+    @property
+    def requires_split(self) -> bool:
+        return self.possible and len(self.parts) > 1
+
+
 def geographic_distance_m(
     point_a: tuple[float, float], point_b: tuple[float, float]
 ) -> float:
@@ -216,6 +252,222 @@ def estimate_flight(
         complete=True,
     )
 
+
+def plan_mission_split(
+    waypoints: list[tuple[float, float, float]]
+    | tuple[tuple[float, float, float], ...],
+    pass_end_indices: list[int] | tuple[int, ...],
+    drone_speed_mps: float,
+    batteries: list[BatteryState] | tuple[BatteryState, ...],
+    *,
+    home_point: tuple[float, float] | None,
+    reserve_percent: float = DEFAULT_RESERVE_PERCENT,
+    photo_interval_s: float = 2.0,
+    vertical_speed_mps: float = DEFAULT_VERTICAL_SPEED_MPS,
+) -> MissionSplitPlan:
+    """Cherche des sous-missions sûres, d'abord aux frontières des passes."""
+    points = tuple(waypoints)
+    if not points:
+        raise AutonomyError("La trajectoire doit contenir au moins un waypoint.")
+    if not 0 <= reserve_percent < 100:
+        raise AutonomyError("La réserve doit être comprise entre 0 inclus et 100 % exclu.")
+    battery_list = tuple(batteries)
+    if not battery_list:
+        raise AutonomyError("Ajoutez au moins une batterie à la mission.")
+    if len(battery_list) > MAX_SPLIT_BATTERIES:
+        raise AutonomyError(
+            f"Le découpage est limité à {MAX_SPLIT_BATTERIES} batteries par mission."
+        )
+    for battery in battery_list:
+        battery.validate()
+
+    original = estimate_flight(
+        points,
+        drone_speed_mps,
+        home_point=home_point,
+        photo_interval_s=photo_interval_s,
+        vertical_speed_mps=vertical_speed_mps,
+    )
+    if home_point is None:
+        return MissionSplitPlan(
+            original_estimate=original,
+            parts=(),
+            possible=False,
+            reason=(
+                "Placez le point Home pour calculer les transits et proposer un "
+                "découpage sûr."
+            ),
+        )
+
+    segment_distances = [
+        geographic_distance_m(first[:2], second[:2])
+        for first, second in zip(points, points[1:])
+    ]
+    cumulative_distance = [0.0]
+    cumulative_short_intervals = [0]
+    for distance in segment_distances:
+        cumulative_distance.append(cumulative_distance[-1] + distance)
+        cumulative_short_intervals.append(
+            cumulative_short_intervals[-1]
+            + int(distance / drone_speed_mps < photo_interval_s)
+        )
+
+    @lru_cache(maxsize=None)
+    def estimate_segment(start: int, end: int) -> FlightEstimate:
+        route_distance = cumulative_distance[end - 1] - cumulative_distance[start]
+        route_duration = route_distance / drone_speed_mps
+        transit_distance = geographic_distance_m(home_point, points[start][:2])
+        transit_distance += geographic_distance_m(points[end - 1][:2], home_point)
+        transit_duration = transit_distance / drone_speed_mps
+        altitude = max(0.0, float(points[start][2]))
+        vertical_duration = 2 * altitude / vertical_speed_mps
+        return FlightEstimate(
+            route_distance_m=route_distance,
+            transit_distance_m=transit_distance,
+            route_duration_s=route_duration,
+            transit_duration_s=transit_duration,
+            vertical_duration_s=vertical_duration,
+            estimated_duration_s=route_duration + transit_duration + vertical_duration,
+            photo_count=end - start,
+            short_photo_intervals=(
+                cumulative_short_intervals[end - 1]
+                - cumulative_short_intervals[start]
+            ),
+            complete=True,
+        )
+
+    boundary_set = {
+        int(index) for index in pass_end_indices if 0 < int(index) <= len(points)
+    }
+    boundary_set.add(len(points))
+
+    def plan_score(parts: tuple[MissionPart, ...]) -> tuple[float, ...]:
+        minimum_margin = min(part.margin_s for part in parts)
+        transit = sum(part.flight_estimate.transit_distance_m or 0 for part in parts)
+        return len(parts), -minimum_margin, transit
+
+    def search(
+        allowed_ends: tuple[int, ...],
+        minimum_margin_s: float = 0.0,
+        maximum_parts: int | None = None,
+    ) -> tuple[MissionPart, ...] | None:
+        def farthest_feasible_end(start: int, available_time: float) -> int | None:
+            first = bisect_right(allowed_ends, start)
+            low = first
+            high = len(allowed_ends) - 1
+            selected = None
+            while low <= high:
+                middle = (low + high) // 2
+                end = allowed_ends[middle]
+                if estimate_segment(start, end).estimated_duration_s <= available_time:
+                    selected = end
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            return selected
+
+        @lru_cache(maxsize=None)
+        def visit(
+            start: int,
+            remaining_batteries: tuple[int, ...],
+            remaining_parts: int,
+        ) -> tuple[MissionPart, ...] | None:
+            if start == len(points):
+                return ()
+            if remaining_parts == 0:
+                return None
+            candidates: list[tuple[MissionPart, ...]] = []
+            tried_safe_times: set[float] = set()
+            for battery_index in remaining_batteries:
+                battery = battery_list[battery_index]
+                safe_time = battery.safe_available_time_s(reserve_percent)
+                if safe_time in tried_safe_times:
+                    continue
+                tried_safe_times.add(safe_time)
+                end = farthest_feasible_end(start, safe_time - minimum_margin_s)
+                if end is None:
+                    continue
+                next_batteries = tuple(
+                    index for index in remaining_batteries if index != battery_index
+                )
+                estimate = estimate_segment(start, end)
+                tail = visit(end, next_batteries, remaining_parts - 1)
+                if tail is None:
+                    continue
+                part = MissionPart(
+                    start_index=start,
+                    end_index=end,
+                    waypoints=points[start:end],
+                    battery=battery,
+                    flight_estimate=estimate,
+                    safe_time_s=safe_time,
+                    margin_s=safe_time - estimate.estimated_duration_s,
+                    ends_on_pass_boundary=end in boundary_set,
+                )
+                candidates.append((part,) + tail)
+            return min(candidates, key=plan_score) if candidates else None
+
+        return visit(
+            0,
+            tuple(range(len(battery_list))),
+            maximum_parts if maximum_parts is not None else len(battery_list),
+        )
+
+    def balanced_search(allowed_ends: tuple[int, ...]) -> tuple[MissionPart, ...] | None:
+        initial = search(allowed_ends)
+        if initial is None:
+            return None
+        low = min(part.margin_s for part in initial)
+        high = max(
+            battery.safe_available_time_s(reserve_percent) for battery in battery_list
+        )
+        best = initial
+        # Une précision inférieure à la seconde est suffisante pour l'affichage métier.
+        for _ in range(14):
+            middle = (low + high) / 2
+            candidate = search(allowed_ends, middle, len(initial))
+            if candidate is None:
+                high = middle
+            else:
+                low = middle
+                best = candidate
+        return best
+
+    pass_plan = balanced_search(tuple(sorted(boundary_set)))
+    selected = pass_plan
+    uses_mid_pass = False
+    if selected is None:
+        selected = balanced_search(tuple(range(1, len(points) + 1)))
+        uses_mid_pass = selected is not None and any(
+            not part.ends_on_pass_boundary for part in selected[:-1]
+        )
+
+    if selected is None:
+        return MissionSplitPlan(
+            original_estimate=original,
+            parts=(),
+            possible=False,
+            reason=(
+                "Les batteries déclarées ne permettent pas de couvrir la mission "
+                "avec la réserve, même après découpage et recalcul de chaque retour."
+            ),
+        )
+
+    if len(selected) == 1:
+        reason = (
+            f"Mission réalisable avec {selected[0].battery.name} et la réserve demandée."
+        )
+    else:
+        reason = f"Mission découpable en {len(selected)} sous-missions sûres."
+        if uses_mid_pass:
+            reason += " Au moins une coupure se situe au milieu d'une passe."
+    return MissionSplitPlan(
+        original_estimate=original,
+        parts=selected,
+        possible=True,
+        reason=reason,
+        uses_mid_pass_cut=uses_mid_pass,
+    )
 
 def _minimum_battery_count(
     batteries: list[BatteryState], reserve_percent: float, required_s: float

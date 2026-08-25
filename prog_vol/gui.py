@@ -41,11 +41,18 @@ from .autonomy import (
     BatteryAssessment,
     BatteryState,
     DEFAULT_BATTERY_PROFILE,
+    FlightEstimate,
+    MAX_SPLIT_BATTERIES,
+    MissionPart,
+    MissionSplitPlan,
     assess_batteries,
     custom_battery_profile,
+    estimate_flight,
+    plan_mission_split,
 )
 from .cadastre import (
-    CadastreGironde,
+    CadastreDepartement,
+    CadastresRegionaux,
     ErreurCadastre,
     ParcelleCadastrale,
     ResultatFusion,
@@ -53,10 +60,12 @@ from .cadastre import (
     fusionner_parcelles,
 )
 from .generator import (
+    GeneratedRoute,
     GenerationError,
     GenerationResult,
     MissionParameters,
-    generate_mission,
+    generate_mission_parts,
+    generate_route_polygon,
 )
 from .main import configure_logging
 from .map_widget import MissionMapWidget
@@ -149,6 +158,47 @@ class ValidationWorker(Worker):
         return inspect_mission(self.source)
 
 
+@dataclass(frozen=True)
+class MissionPreparation:
+    output_path: Path
+    parameters: MissionParameters
+    route: GeneratedRoute
+    batteries: tuple[BatteryState, ...]
+    reserve_percent: float
+    flight_estimate: FlightEstimate
+    assessment: BatteryAssessment
+    split_plan: MissionSplitPlan | None
+
+
+@dataclass(frozen=True)
+class GeneratedMissionItem:
+    result: GenerationResult
+    archive: MissionArchive
+    assessment: BatteryAssessment
+    part_number: int
+    part_count: int
+    battery: BatteryState | None
+
+
+@dataclass(frozen=True)
+class GeneratedMissionBatch:
+    items: tuple[GeneratedMissionItem, ...]
+    preparation: MissionPreparation
+
+
+def split_plan_summary(plan: MissionSplitPlan) -> str:
+    lines = [plan.reason, ""]
+    for number, part in enumerate(plan.parts, start=1):
+        boundary = "fin de passe" if part.ends_on_pass_boundary else "milieu de passe"
+        lines.append(
+            f"Partie {number}/{len(plan.parts)} : WP {part.start_index + 1} à "
+            f"{part.end_index}, {part.battery.name}, "
+            f"{human_duration(part.flight_estimate.estimated_duration_s)}, "
+            f"marge {human_duration(part.margin_s)} ({boundary})"
+        )
+    return "\n".join(lines)
+
+
 class GenerationWorker(Worker):
     def __init__(
         self,
@@ -167,25 +217,124 @@ class GenerationWorker(Worker):
         self.batteries = batteries
         self.reserve_percent = reserve_percent
 
-    def work(self) -> tuple[GenerationResult, MissionArchive, BatteryAssessment]:
-        result = generate_mission(
-            self.points,
-            self.parameters,
-            self.output_path,
+    def work(self) -> MissionPreparation:
+        route = generate_route_polygon(self.points, self.parameters)
+        estimate = estimate_flight(
+            route.waypoints,
+            self.parameters.drone_speed,
             home_point=self.home_point,
+            photo_interval_s=self.parameters.photo_interval,
         )
         assessment = assess_batteries(
-            result.flight_estimate,
+            estimate,
             self.batteries,
             self.reserve_percent,
         )
-        return result, inspect_mission(result.output_path), assessment
+        split_plan = None
+        if self.home_point is not None:
+            split_plan = plan_mission_split(
+                route.waypoints,
+                route.pass_end_indices,
+                self.parameters.drone_speed,
+                self.batteries,
+                home_point=self.home_point,
+                reserve_percent=self.reserve_percent,
+                photo_interval_s=self.parameters.photo_interval,
+            )
+        return MissionPreparation(
+            output_path=self.output_path,
+            parameters=self.parameters,
+            route=route,
+            batteries=self.batteries,
+            reserve_percent=self.reserve_percent,
+            flight_estimate=estimate,
+            assessment=assessment,
+            split_plan=split_plan,
+        )
+
+
+class MissionWriteWorker(Worker):
+    def __init__(self, preparation: MissionPreparation) -> None:
+        super().__init__()
+        self.preparation = preparation
+
+    def work(self) -> GeneratedMissionBatch:
+        preparation = self.preparation
+        items: list[GeneratedMissionItem] = []
+        if preparation.split_plan is not None and preparation.split_plan.possible:
+            generated = generate_mission_parts(
+                preparation.route,
+                preparation.parameters,
+                preparation.output_path,
+                preparation.split_plan,
+            )
+            for number, (result, part) in enumerate(
+                zip(generated.results, generated.split_plan.parts), start=1
+            ):
+                assessment = assess_batteries(
+                    result.flight_estimate,
+                    (part.battery,),
+                    preparation.reserve_percent,
+                )
+                items.append(
+                    GeneratedMissionItem(
+                        result=result,
+                        archive=inspect_mission(result.output_path),
+                        assessment=assessment,
+                        part_number=number,
+                        part_count=len(generated.results),
+                        battery=part.battery,
+                    )
+                )
+        else:
+            flight_estimate = preparation.flight_estimate
+            battery = preparation.assessment.recommended_battery
+            if battery is None:
+                raise AutonomyError(
+                    "Aucune batterie ne peut être affectée à cette mission."
+                )
+            safe_time = battery.safe_available_time_s(preparation.reserve_percent)
+            single_plan = MissionSplitPlan(
+                original_estimate=flight_estimate,
+                parts=(
+                    MissionPart(
+                        start_index=0,
+                        end_index=len(preparation.route.waypoints),
+                        waypoints=preparation.route.waypoints,
+                        battery=battery,
+                        flight_estimate=flight_estimate,
+                        safe_time_s=safe_time,
+                        margin_s=safe_time - flight_estimate.estimated_duration_s,
+                        ends_on_pass_boundary=True,
+                    ),
+                ),
+                possible=True,
+                reason=preparation.assessment.message,
+            )
+            generated = generate_mission_parts(
+                preparation.route,
+                preparation.parameters,
+                preparation.output_path,
+                single_plan,
+            )
+            result = generated.results[0]
+            items.append(
+                GeneratedMissionItem(
+                    result=result,
+                    archive=inspect_mission(result.output_path),
+                    assessment=preparation.assessment,
+                    part_number=1,
+                    part_count=1,
+                    battery=preparation.assessment.recommended_battery,
+                )
+            )
+        return GeneratedMissionBatch(tuple(items), preparation)
 
 
 class InstallationCadastreWorker(Worker):
     progression = pyqtSignal(str, int)
 
-    def __init__(self, cadastre: CadastreGironde) -> None:
+    def __init__(self, cadastre: CadastreDepartement) -> None:
         super().__init__()
         self.cadastre = cadastre
 
@@ -500,12 +649,14 @@ class BatteryRowWidget(QFrame):
 
 
 class GenerationTab(ThreadedPanel):
-    mission_generated = pyqtSignal(object, object, object)
+    mission_generated = pyqtSignal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.cadastre = CadastreGironde()
+        self.cadastres = CadastresRegionaux()
+        self.cadastre_en_installation: CadastreDepartement | None = None
         self.parcelles_selectionnees: dict[str, ParcelleCadastrale] = {}
+        self._pending_write: MissionPreparation | None = None
         self._build_ui()
         self.actualiser_etat_cadastre()
         self.changer_mode_zone(0)
@@ -569,20 +720,29 @@ class GenerationTab(ThreadedPanel):
         self.location_status.setWordWrap(True)
         controls_layout.addWidget(self.location_status)
 
-        controls_layout.addWidget(self._section_label("Parcelles cadastrales de Gironde"))
-        self.cadastre_status = QLabel()
-        self.cadastre_status.setObjectName("mutedSmall")
-        self.cadastre_status.setWordWrap(True)
-        controls_layout.addWidget(self.cadastre_status)
+        controls_layout.addWidget(
+            self._section_label("Parcelles cadastrales de Gironde et des Landes")
+        )
+        self.cadastre_status_labels: dict[str, QLabel] = {}
+        self.install_cadastre_buttons: dict[str, QPushButton] = {}
+        for cadastre in self.cadastres.cadastres:
+            code = cadastre.configuration.code
+            status = QLabel()
+            status.setObjectName("mutedSmall")
+            status.setWordWrap(True)
+            controls_layout.addWidget(status)
+            self.cadastre_status_labels[code] = status
+            button = QPushButton()
+            button.setObjectName("secondaryButton")
+            button.clicked.connect(
+                lambda _checked=False, item=cadastre: self.installer_cadastre(item)
+            )
+            controls_layout.addWidget(button)
+            self.install_cadastre_buttons[code] = button
         self.cadastre_progress = QProgressBar()
         self.cadastre_progress.setRange(0, 100)
         self.cadastre_progress.setVisible(False)
         controls_layout.addWidget(self.cadastre_progress)
-        self.install_cadastre_button = QPushButton("Installer les données cadastrales")
-        self.install_cadastre_button.setObjectName("secondaryButton")
-        self.install_cadastre_button.clicked.connect(self.installer_cadastre)
-        controls_layout.addWidget(self.install_cadastre_button)
-
         self.mode_zone = QComboBox()
         self.mode_zone.addItems(("Dessin libre", "Sélection cadastrale"))
         controls_layout.addWidget(self.mode_zone)
@@ -590,7 +750,9 @@ class GenerationTab(ThreadedPanel):
         reference_form = QFormLayout()
         reference_form.setSpacing(7)
         self.commune_cadastrale = QLineEdit()
-        self.commune_cadastrale.setPlaceholderText("Ex. 33522 pour Talence")
+        self.commune_cadastrale.setPlaceholderText(
+            "Ex. 33522 pour Talence ou 40192 pour Mont-de-Marsan"
+        )
         self.prefixe_cadastral = QLineEdit()
         self.prefixe_cadastral.setPlaceholderText("Optionnel, ex. 000")
         self.section_cadastrale = QLineEdit()
@@ -737,6 +899,13 @@ class GenerationTab(ThreadedPanel):
         return label
 
     def add_battery(self) -> None:
+        if len(self.battery_rows) >= MAX_SPLIT_BATTERIES:
+            QMessageBox.information(
+                self,
+                "Batteries",
+                f"Le découpage est limité à {MAX_SPLIT_BATTERIES} batteries.",
+            )
+            return
         row = BatteryRowWidget()
         row.remove_requested.connect(self.remove_battery)
         self.battery_rows.append(row)
@@ -761,6 +930,9 @@ class GenerationTab(ThreadedPanel):
         self.reserve.setValue(20)
 
     def _refresh_battery_rows(self) -> None:
+        self.add_battery_button.setEnabled(
+            not self.busy and len(self.battery_rows) < MAX_SPLIT_BATTERIES
+        )
         for number, row in enumerate(self.battery_rows, start=1):
             row.set_number(number)
             row.remove_button.setEnabled(len(self.battery_rows) > 1 and not self.busy)
@@ -823,38 +995,48 @@ class GenerationTab(ThreadedPanel):
         self.location_status.setText(address)
 
     def actualiser_etat_cadastre(self) -> None:
-        installe = self.cadastre.est_installe
-        if installe:
-            informations = self.cadastre.informations()
-            nombre = int(informations.get("nombre_parcelles", "0"))
-            version = informations.get("version_donnees", "inconnue")
-            self.cadastre_status.setText(
-                f"Données installées : {nombre:,} parcelles de Gironde, "
-                f"version {version}.".replace(",", " ")
-            )
-            self.install_cadastre_button.setText("Mettre à jour les données cadastrales")
-        else:
-            self.cadastre_status.setText(
-                "Données non installées. Téléchargement initial : environ 236 Mo; "
-                "prévoir 3 Go d'espace libre pendant l'indexation."
-            )
-            self.install_cadastre_button.setText("Installer les données cadastrales")
+        for cadastre in self.cadastres.cadastres:
+            configuration = cadastre.configuration
+            status = self.cadastre_status_labels[configuration.code]
+            button = self.install_cadastre_buttons[configuration.code]
+            if cadastre.est_installe:
+                informations = cadastre.informations()
+                nombre = int(informations.get("nombre_parcelles", "0"))
+                version = informations.get("version_donnees", "inconnue")
+                status.setText(
+                    f"{configuration.libelle} : {nombre:,} parcelles installées, "
+                    f"version {version}.".replace(",", " ")
+                )
+                button.setText(f"Mettre à jour {configuration.nom}")
+            else:
+                taille_mo = round(configuration.taille_archive_estimee / 1_000_000)
+                status.setText(
+                    f"{configuration.libelle} : non installée, téléchargement "
+                    f"d'environ {taille_mo} Mo."
+                )
+                button.setText(f"Installer {configuration.nom}")
         self.search_parcelle_button.setEnabled(
-            not self.busy and installe and self.mode_zone.currentIndex() == 1
+            not self.busy
+            and bool(self.cadastres.installes)
+            and self.mode_zone.currentIndex() == 1
         )
 
-    def installer_cadastre(self) -> None:
-        action = "mettre à jour" if self.cadastre.est_installe else "installer"
+    def installer_cadastre(self, cadastre: CadastreDepartement) -> None:
+        configuration = cadastre.configuration
+        action = "mettre à jour" if cadastre.est_installe else "installer"
+        taille_mo = round(configuration.taille_archive_estimee / 1_000_000)
         confirmation = QMessageBox.question(
             self,
-            "Données cadastrales de Gironde",
-            f"Voulez-vous {action} la base officielle des parcelles de Gironde ?\n\n"
-            "Le téléchargement représente environ 236 Mo et l'indexation peut durer "
+            f"Données cadastrales de {configuration.nom}",
+            f"Voulez-vous {action} la base officielle des parcelles de "
+            f"{configuration.nom} ?\n\n"
+            f"Le téléchargement représente environ {taille_mo} Mo et l'indexation peut durer "
             "plusieurs minutes.",
         )
         if confirmation != QMessageBox.Yes:
             return
-        worker = InstallationCadastreWorker(self.cadastre)
+        self.cadastre_en_installation = cadastre
+        worker = InstallationCadastreWorker(cadastre)
         worker.progression.connect(self.progression_cadastre)
         self.cadastre_progress.setVisible(True)
         self.cadastre_progress.setValue(0)
@@ -862,35 +1044,42 @@ class GenerationTab(ThreadedPanel):
 
     @pyqtSlot(str, int)
     def progression_cadastre(self, message: str, pourcentage: int) -> None:
-        self.cadastre_status.setText(message)
+        if self.cadastre_en_installation is not None:
+            code = self.cadastre_en_installation.configuration.code
+            self.cadastre_status_labels[code].setText(message)
         self.cadastre_progress.setValue(pourcentage)
 
     @pyqtSlot(object)
     def cadastre_installe(self, nombre: object) -> None:
+        cadastre = self.cadastre_en_installation
         self.cadastre_progress.setValue(100)
         self.cadastre_progress.setVisible(False)
-        self.parcelles_selectionnees.clear()
-        self.parcelles_list.clear()
-        self.map_widget.reset()
-        self.reset_batteries()
-        self.map_widget.set_mode_selection(self.mode_zone.currentIndex() == 1)
-        self.parcelles_status.setText("Aucune parcelle cadastrale sélectionnée.")
-        self.result_label.setText("La mission générée sera résumée ici.")
+        if cadastre is not None:
+            code = cadastre.configuration.code
+            if any(
+                parcelle.code_departement == code
+                for parcelle in self.parcelles_selectionnees.values()
+            ):
+                self.parcelles_selectionnees.clear()
+                self.actualiser_selection_cadastrale()
+                self.result_label.setText("La mission générée sera résumée ici.")
         self.actualiser_etat_cadastre()
+        self.cadastre_en_installation = None
+        libelle = cadastre.configuration.libelle if cadastre is not None else "Cadastre"
         QMessageBox.information(
             self,
             "Données cadastrales prêtes",
-            f"La base locale contient {int(nombre):,} parcelles de Gironde.".replace(",", " "),
+            f"La base locale {libelle} contient {int(nombre):,} parcelles.".replace(",", " "),
         )
 
     @pyqtSlot(int)
     def changer_mode_zone(self, index: int) -> None:
         cadastral = index == 1
-        if cadastral and not self.cadastre.est_installe:
+        if cadastral and not self.cadastres.installes:
             QMessageBox.information(
                 self,
                 "Sélection cadastrale",
-                "Installez d'abord les données cadastrales de Gironde.",
+                "Installez d'abord les données cadastrales de Gironde ou des Landes.",
             )
             self.mode_zone.blockSignals(True)
             self.mode_zone.setCurrentIndex(0)
@@ -918,7 +1107,7 @@ class GenerationTab(ThreadedPanel):
 
     def rechercher_parcelle(self) -> None:
         try:
-            parcelle = self.cadastre.rechercher_reference(
+            parcelle = self.cadastres.rechercher_reference(
                 self.commune_cadastrale.text(),
                 self.section_cadastrale.text(),
                 self.numero_parcelle.text(),
@@ -933,17 +1122,17 @@ class GenerationTab(ThreadedPanel):
         if self.busy or self.mode_zone.currentIndex() != 1:
             return
         try:
-            parcelle = self.cadastre.rechercher_point(latitude, longitude)
+            parcelle = self.cadastres.rechercher_point(latitude, longitude)
             self.ajouter_ou_retirer_parcelle(parcelle)
         except ErreurCadastre as exc:
             QMessageBox.information(self, "Sélection cadastrale", str(exc))
 
     def ajouter_ou_retirer_parcelle(self, parcelle: ParcelleCadastrale) -> None:
         nouvelle_selection = dict(self.parcelles_selectionnees)
-        if parcelle.identifiant in nouvelle_selection:
-            nouvelle_selection.pop(parcelle.identifiant)
+        if parcelle.cle in nouvelle_selection:
+            nouvelle_selection.pop(parcelle.cle)
         else:
-            nouvelle_selection[parcelle.identifiant] = parcelle
+            nouvelle_selection[parcelle.cle] = parcelle
         fusion: ResultatFusion | None = None
         if nouvelle_selection:
             try:
@@ -959,10 +1148,16 @@ class GenerationTab(ThreadedPanel):
         self.parcelles_list.clear()
         for parcelle in sorted(
             parcelles,
-            key=lambda item: (item.commune, item.prefixe, item.section, item.numero),
+            key=lambda item: (
+                item.code_departement,
+                item.commune,
+                item.prefixe,
+                item.section,
+                item.numero,
+            ),
         ):
             item = QListWidgetItem(parcelle.description)
-            item.setData(Qt.UserRole, parcelle.identifiant)
+            item.setData(Qt.UserRole, parcelle.cle)
             self.parcelles_list.addItem(item)
         self.map_widget.afficher_parcelles_selectionnees(collection_geojson(parcelles))
         if not parcelles:
@@ -1054,7 +1249,7 @@ class GenerationTab(ThreadedPanel):
         except AutonomyError as exc:
             QMessageBox.warning(self, "Batteries", str(exc))
             return
-        self.result_label.setText("Calcul de la trajectoire et création du KMZ...")
+        self.result_label.setText("Calcul de la trajectoire et de l'autonomie...")
         self.start_worker(
             GenerationWorker(
                 list(self.map_widget.points),
@@ -1064,41 +1259,98 @@ class GenerationTab(ThreadedPanel):
                 batteries,
                 self.reserve.value(),
             ),
-            self.generation_completed,
+            self.preparation_completed,
         )
 
     @pyqtSlot(object)
-    def generation_completed(self, payload: object) -> None:
-        result, archive, assessment = payload
-        estimate = result.flight_estimate
-        self.map_widget.show_waypoints(result.waypoints)
+    def preparation_completed(self, preparation: MissionPreparation) -> None:
+        plan = preparation.split_plan
+        if plan is None:
+            self.map_widget.show_waypoints(preparation.route.waypoints)
+            if preparation.assessment.level is AlertLevel.CRITICAL:
+                self.result_label.setText(
+                    preparation.assessment.message
+                    + "\nPlacez le point Home pour calculer un découpage sûr."
+                )
+                QMessageBox.warning(
+                    self,
+                    "Home requis",
+                    preparation.assessment.message
+                    + "\n\nPlacez le point Home avant de générer les sous-missions.",
+                )
+                return
+            self._write_prepared_mission(preparation)
+            return
+
+        if not plan.possible:
+            self.map_widget.show_waypoints(preparation.route.waypoints)
+            self.result_label.setText(plan.reason)
+            QMessageBox.critical(self, "Découpage impossible", plan.reason)
+            return
+
+        if plan.requires_split:
+            self.map_widget.show_mission_parts(
+                tuple(part.waypoints for part in plan.parts)
+            )
+            answer = QMessageBox.question(
+                self,
+                "Découper la mission",
+                split_plan_summary(plan)
+                + "\n\nGénérer ces fichiers KMZ séparés ?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                self.result_label.setText(
+                    "Découpage proposé puis annulé. Aucun fichier n'a été créé."
+                )
+                return
+        self._write_prepared_mission(preparation)
+
+    def _write_prepared_mission(self, preparation: MissionPreparation) -> None:
+        self.result_label.setText("Création et validation des fichiers KMZ...")
+        if self.busy:
+            self._pending_write = preparation
+            return
+        self.start_worker(MissionWriteWorker(preparation), self.generation_completed)
+
+    @pyqtSlot(object)
+    def generation_completed(self, batch: GeneratedMissionBatch) -> None:
+        preparation = batch.preparation
+        items = batch.items
+        estimate = preparation.flight_estimate
+        if len(items) > 1:
+            self.map_widget.show_mission_parts(
+                tuple(item.result.waypoints for item in items)
+            )
+        else:
+            self.map_widget.show_waypoints(items[0].result.waypoints)
         distance_line = f"Distance dans la zone : {estimate.route_distance_m / 1000:.2f} km"
         if estimate.transit_distance_m is not None:
             distance_line += f" • transit : {estimate.transit_distance_m / 1000:.2f} km"
         else:
             distance_line += " • transit non calculé"
-        alert_names = {
-            AlertLevel.OK: "AUTONOMIE OK",
-            AlertLevel.WARNING: "AVERTISSEMENT AUTONOMIE",
-            AlertLevel.CRITICAL: "CHARGE INSUFFISANTE",
-            AlertLevel.PARTIAL: "ESTIMATION PARTIELLE",
-        }
+        assessment = preparation.assessment
         details = [
-            f"Mission prête : {result.waypoint_count} waypoints sur "
-            f"{result.line_count} passe(s), {estimate.photo_count} photos prévues.",
+            f"Mission prête : {len(preparation.route.waypoints)} waypoints sur "
+            f"{preparation.route.line_count} passe(s), {estimate.photo_count} photos prévues.",
             distance_line,
             f"Durée estimée : {human_duration(estimate.estimated_duration_s)}",
-            f"{alert_names[assessment.level]} : {assessment.message}",
+            (
+                f"Découpage validé en {len(items)} parties sûres."
+                if len(items) > 1
+                else f"Autonomie : {assessment.message}"
+            ),
         ]
-        if assessment.recommended_battery is not None:
-            battery = assessment.recommended_battery
+        for item in items:
+            battery = item.battery
+            battery_label = battery.name if battery is not None else "non évaluée"
             details.append(
-                f"Batterie recommandée : {battery.name}, {battery.charge_percent:.0f} % "
-                f"({battery.profile.model})"
+                f"Partie {item.part_number}/{item.part_count} : "
+                f"{item.result.waypoint_count} WP, {battery_label}, "
+                f"{human_duration(item.result.flight_estimate.estimated_duration_s)}, "
+                f"marge {human_duration(max(0, item.assessment.margin_s or 0))}."
             )
-        if assessment.margin_s is not None:
-            margin_label = "Marge sûre" if assessment.margin_s >= 0 else "Déficit"
-            details.append(f"{margin_label} : {human_duration(abs(assessment.margin_s))}")
         if estimate.short_photo_intervals:
             details.append(
                 f"Cadence photo : {estimate.short_photo_intervals} segment(s) trop courts "
@@ -1110,12 +1362,12 @@ class GenerationTab(ThreadedPanel):
             )
         details.extend(
             (
-                f"FOV : {result.fov_width:.1f} × {result.fov_height:.1f} m",
-                f"Fichier : {result.output_path}",
+                f"FOV : {preparation.route.fov_width:.1f} × {preparation.route.fov_height:.1f} m",
+                "Fichiers : " + ", ".join(str(item.result.output_path) for item in items),
             )
         )
         self.result_label.setText("\n".join(details))
-        self.mission_generated.emit(result, archive, assessment)
+        self.mission_generated.emit(batch)
         cadence_note = ""
         if estimate.short_photo_intervals:
             cadence_note = (
@@ -1124,11 +1376,12 @@ class GenerationTab(ThreadedPanel):
                 "pas la résolution de la caméra dans le KMZ."
             )
         dialog_text = (
-            f"Le KMZ a été généré et validé avec {archive.waypoint_count} waypoints.\n\n"
-            f"{assessment.message}{cadence_note}\n\n"
-            "Il est maintenant sélectionné dans l'onglet Radiocommande et transfert."
+            f"{len(items)} fichier(s) KMZ ont été générés et validés.\n\n"
+            f"{preparation.split_plan.reason if preparation.split_plan else assessment.message}"
+            f"{cadence_note}\n\n"
+            "Les parties sont maintenant disponibles dans l'onglet Radiocommande et transfert."
         )
-        dialog = {
+        dialog = QMessageBox.information if len(items) > 1 else {
             AlertLevel.OK: QMessageBox.information,
             AlertLevel.WARNING: QMessageBox.warning,
             AlertLevel.CRITICAL: QMessageBox.critical,
@@ -1149,7 +1402,8 @@ class GenerationTab(ThreadedPanel):
         )
         self.reset_button.setEnabled(not busy)
         self.generate_button.setEnabled(not busy and self.map_widget.is_closed)
-        self.install_cadastre_button.setEnabled(not busy)
+        for button in self.install_cadastre_buttons.values():
+            button.setEnabled(not busy)
         self.mode_zone.setEnabled(not busy)
         self.add_battery_button.setEnabled(not busy)
         self.reserve.setEnabled(not busy)
@@ -1160,7 +1414,9 @@ class GenerationTab(ThreadedPanel):
             row.setEnabled(not busy)
         self._refresh_battery_rows()
         cadastral_disponible = (
-            not busy and self.mode_zone.currentIndex() == 1 and self.cadastre.est_installe
+            not busy
+            and self.mode_zone.currentIndex() == 1
+            and bool(self.cadastres.installes)
         )
         for widget in (
             self.commune_cadastrale,
@@ -1178,12 +1434,21 @@ class GenerationTab(ThreadedPanel):
     def worker_failed(self, message: str) -> None:
         if isinstance(self.worker, InstallationCadastreWorker):
             self.cadastre_progress.setVisible(False)
+            self.cadastre_en_installation = None
             self.actualiser_etat_cadastre()
         elif isinstance(self.worker, GeocodeWorker):
             self.location_status.setText(message)
         else:
             self.result_label.setText(message)
         super().worker_failed(message)
+
+    @pyqtSlot()
+    def worker_finished(self) -> None:
+        super().worker_finished()
+        if self._pending_write is not None:
+            preparation = self._pending_write
+            self._pending_write = None
+            self._write_prepared_mission(preparation)
 
 
 class TransferTab(ThreadedPanel):
@@ -1192,6 +1457,7 @@ class TransferTab(ThreadedPanel):
         self.source_archive: MissionArchive | None = None
         self.source_assessment: BatteryAssessment | None = None
         self.source_cadence_warning: str | None = None
+        self.generated_sources: tuple[GeneratedMissionItem, ...] = ()
         self.detection: DetectionResult | None = None
         self.refresh_after_task = False
         self._build_ui()
@@ -1255,6 +1521,12 @@ class TransferTab(ThreadedPanel):
         source_header.addStretch()
         source_header.addWidget(self.choose_source_button)
         source_layout.addLayout(source_header)
+        self.source_part_combo = QComboBox()
+        self.source_part_combo.currentIndexChanged.connect(
+            self._select_generated_source
+        )
+        self.source_part_combo.hide()
+        source_layout.addWidget(self.source_part_combo)
         self.source_label = QLabel("Aucun fichier sélectionné.")
         self.source_label.setWordWrap(True)
         source_layout.addWidget(self.source_label)
@@ -1346,20 +1618,55 @@ class TransferTab(ThreadedPanel):
         self.progress_label.setText("")
         self.set_source_archive(archive)
 
-    @pyqtSlot(object, object, object)
-    def set_generated_source(
-        self, result: object, archive: object, assessment: object
-    ) -> None:
-        short_intervals = result.flight_estimate.short_photo_intervals
+    @pyqtSlot(object)
+    def set_generated_sources(self, batch: GeneratedMissionBatch) -> None:
+        self.generated_sources = batch.items
+        self.source_part_combo.blockSignals(True)
+        self.source_part_combo.clear()
+        for item in batch.items:
+            battery = (
+                item.battery.name
+                if item.battery is not None
+                else "batterie non évaluée"
+            )
+            self.source_part_combo.addItem(
+                f"Partie {item.part_number}/{item.part_count} — {battery}", item
+            )
+        self.source_part_combo.blockSignals(False)
+        self.source_part_combo.setVisible(len(batch.items) > 1)
+        if batch.items:
+            self.source_part_combo.setCurrentIndex(0)
+            self._display_generated_source(batch.items[0])
+
+    @pyqtSlot(int)
+    def _select_generated_source(self, index: int) -> None:
+        if 0 <= index < len(self.generated_sources):
+            self._display_generated_source(self.generated_sources[index])
+
+    def _display_generated_source(self, item: GeneratedMissionItem) -> None:
+        short_intervals = item.result.flight_estimate.short_photo_intervals
         cadence_warning = None
         if short_intervals:
             cadence_warning = (
                 f"{short_intervals} intervalle(s) photo sont trop courts pour la "
                 "cadence supposée."
             )
-        self.set_source_archive(archive, assessment, cadence_warning)
+        self._display_source_archive(item.archive, item.assessment, cadence_warning)
 
     def set_source_archive(
+        self,
+        archive: MissionArchive,
+        assessment: BatteryAssessment | None = None,
+        cadence_warning: str | None = None,
+    ) -> None:
+        self.generated_sources = ()
+        self.source_part_combo.blockSignals(True)
+        self.source_part_combo.clear()
+        self.source_part_combo.blockSignals(False)
+        self.source_part_combo.hide()
+        self._display_source_archive(archive, assessment, cadence_warning)
+
+    def _display_source_archive(
         self,
         archive: MissionArchive,
         assessment: BatteryAssessment | None = None,
@@ -1463,6 +1770,7 @@ class TransferTab(ThreadedPanel):
     def set_busy(self, busy: bool) -> None:
         self.detect_button.setEnabled(not busy)
         self.choose_source_button.setEnabled(not busy)
+        self.source_part_combo.setEnabled(not busy)
         self.mission_list.setEnabled(not busy)
         self.progress_bar.setVisible(busy)
         self.progress_label.setVisible(busy or bool(self.progress_label.text()))
@@ -1499,7 +1807,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.transfer_tab, "2. Radiocommande et transfert")
         self.setCentralWidget(self.tabs)
         self.generation_tab.mission_generated.connect(
-            self.transfer_tab.set_generated_source
+            self.transfer_tab.set_generated_sources
         )
         self._apply_style()
 

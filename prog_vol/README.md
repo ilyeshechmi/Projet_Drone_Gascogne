@@ -8,8 +8,8 @@ Cette application réunit dans une seule interface graphique les deux étapes qu
    son fichier puis le remplacer de manière vérifiée.
 
 La version actuelle utilise OpenStreetMap et permet aussi d'installer localement
-les parcelles cadastrales officielles de Gironde afin de sélectionner une zone
-par clic ou par référence cadastrale.
+les parcelles cadastrales officielles de Gironde et des Landes afin de sélectionner
+une zone par clic ou par référence cadastrale.
 
 ## Avertissement de sécurité
 
@@ -27,10 +27,13 @@ terrain et de la réglementation aérienne.
 - recherche d'un lieu avec Nominatim ;
 - carte Leaflet et fond OpenStreetMap ;
 - dessin d'un polygone libre comportant au moins trois sommets ;
-- téléchargement et indexation locale des parcelles cadastrales de Gironde ;
+- téléchargement et indexation locale des parcelles cadastrales de Gironde et des Landes ;
+- détection automatique du département par clic ou par code INSEE ;
 - recherche par code INSEE, préfixe, section et numéro de parcelle ;
 - sélection par clic et fusion des parcelles adjacentes ;
 - calcul d'une trajectoire en boustrophédon ;
+- proposition de découpage lorsque l'autonomie sûre d'une batterie est dépassée ;
+- génération de plusieurs KMZ avec affectation d'une batterie par partie ;
 - aperçu des waypoints et de la trajectoire ;
 - génération d'une archive `wpmz/template.kml` + `wpmz/waylines.wpml` ;
 - validation immédiate du KMZ produit ;
@@ -55,9 +58,10 @@ terrain et de la réglementation aérienne.
 L'environnement virtuel compatible se trouve dans `../env_drone/`, à côté du
 dossier `Projet_Drone_Gascogne/`.
 
-L'installation cadastrale télécharge environ 236 Mo. Il faut prévoir au moins
-3 Go libres pendant la construction de la base locale. La base est conservée
-hors du dépôt, dans le dossier de données de l'utilisateur.
+L'installation cadastrale télécharge environ 236 Mo pour la Gironde et 134 Mo
+pour les Landes. Il faut prévoir au moins 3 Go libres pendant la construction
+d'une base locale. Les bases sont conservées hors du dépôt, dans le dossier de
+données de l'utilisateur.
 
 ### Installation avec l'environnement existant
 
@@ -132,18 +136,21 @@ fenêtre.
 Si la recherche échoue, la carte reste utilisable et peut être déplacée
 manuellement.
 
-### 2. Utiliser les parcelles cadastrales de Gironde
+### 2. Utiliser les parcelles cadastrales de Gironde et des Landes
 
 Le dessin libre reste disponible. Pour utiliser le cadastre :
 
-1. cliquer sur `Installer les données cadastrales` lors de la première utilisation ;
+1. installer les données de Gironde, des Landes ou des deux départements ;
 2. attendre la fin du téléchargement et de l'indexation locale ;
 3. choisir `Sélection cadastrale` ;
 4. cliquer au centre d'une parcelle sur la carte, ou renseigner son code INSEE,
    son préfixe éventuel, sa section et son numéro ;
 5. sélectionner d'autres parcelles adjacentes si nécessaire.
 
-Un second clic sur une parcelle déjà sélectionnée la retire. Les parcelles qui ne
+Le département est détecté automatiquement parmi les bases installées. Une
+recherche textuelle utilise le préfixe du code INSEE (`33` ou `40`), tandis qu'un
+clic interroge les deux bases. Un second clic sur une parcelle déjà sélectionnée
+la retire. Les parcelles qui ne
 se touchent pas sont refusées dans cette première version afin de ne pas créer de
 transition de vol hors de la zone demandée. La contenance affichée vient du
 cadastre; elle est donnée en mètres carrés.
@@ -154,8 +161,9 @@ La base SQLite est enregistrée sous macOS dans :
 ~/Library/Application Support/Projet Drone Gascogne/cadastre/
 ```
 
-Le fichier compressé est supprimé après l'indexation. Les données locales peuvent
-être remplacées avec le bouton `Mettre à jour les données cadastrales`.
+Les fichiers `cadastre_gironde.sqlite` et `cadastre_landes.sqlite` sont indépendants.
+Le fichier compressé est supprimé après chaque indexation. Chaque département
+peut être installé ou mis à jour séparément.
 
 ### 3. Régler les paramètres
 
@@ -195,8 +203,12 @@ batterie personnalisée sans autonomie mesurée, la durée est extrapolée à pa
 des Wh et signalée comme moins fiable.
 
 Plusieurs batteries ne permettent pas d'exécuter un KMZ continu : changer de
-batterie impose un atterrissage et un découpage de la mission. Cette version
-affiche l'alerte mais ne réalise pas encore ce découpage.
+batterie impose un atterrissage et un découpage de la mission. Si aucune batterie
+ne couvre la mission avec la réserve demandée, le programme recherche des
+sous-missions contiguës et recalcule pour chacune la montée, le transit aller, le
+retour au Home et la descente. Le Home est donc obligatoire pour cette opération.
+La recherche est limitée à 12 batteries par mission afin de borner le temps de
+calcul combinatoire.
 
 Les sources, hypothèses, formules et niveaux d'alerte sont détaillés dans
 [`AUTONOMIE_DRONE.md`](AUTONOMIE_DRONE.md).
@@ -223,10 +235,26 @@ Le programme :
 2. calcule les lignes de balayage ;
 3. produit les waypoints en alternant leur direction ;
 4. limite la mission à 20 000 waypoints pour protéger la mémoire ;
-5. écrit le KMZ ;
-6. relit et valide l'archive ;
-7. affiche les waypoints sur la carte ;
-8. sélectionne le fichier dans l'onglet de transfert.
+5. évalue chaque batterie avec la réserve demandée ;
+6. propose un découpage si aucune batterie ne suffit seule ;
+7. privilégie les coupures entre deux passes complètes ;
+8. utilise une coupure entre waypoints seulement si aucun plan par passes n'est possible ;
+9. écrit un ou plusieurs KMZ après confirmation ;
+10. relit et valide chaque archive ;
+11. affiche chaque partie avec une couleur distincte sur la carte ;
+12. place les fichiers dans le sélecteur de l'onglet de transfert.
+
+Les fichiers découpés sont nommés par exemple :
+
+```text
+mission_partie_01_sur_03.kmz
+mission_partie_02_sur_03.kmz
+mission_partie_03_sur_03.kmz
+```
+
+Chaque partie utilise `goHome` comme action de fin et doit être contrôlée dans DJI
+Fly avant le vol. Si les transits répétés rendent les batteries insuffisantes,
+aucun fichier n'est créé.
 
 Aucun message de réussite n'est affiché avant la création et la validation
 effectives du fichier.
@@ -260,8 +288,11 @@ Actualiser la liste après toute création ou modification effectuée dans DJI F
 
 ### 3. Choisir le KMZ source
 
-Le fichier produit dans le premier onglet est sélectionné automatiquement. Le
-bouton `Changer le fichier KMZ` permet d'utiliser un autre fichier local.
+Le ou les fichiers produits dans le premier onglet sont sélectionnés
+automatiquement. Pour une mission découpée, un sélecteur permet de choisir la
+partie à transférer. Chaque partie doit être transférée séparément vers une
+mission brouillon DJI Fly distincte. Le bouton `Changer le fichier KMZ` permet
+d'utiliser un autre fichier local.
 
 Avant d'activer le transfert, le programme vérifie :
 
@@ -345,7 +376,7 @@ python -m prog_vol.main --help
 prog_vol/
 ├── __init__.py       API Python publique
 ├── __main__.py       point d'entrée de l'interface graphique
-├── autonomy.py       durée de vol, profils et alertes batterie
+├── autonomy.py       durée de vol, profils, alertes et découpage batterie
 ├── gui.py            fenêtre, onglets et workers QThread
 ├── map_widget.py     Leaflet, QWebEngineView et QWebChannel
 ├── cadastre.py       téléchargement, SQLite/RTree et géométries cadastrales
@@ -403,6 +434,10 @@ ajouter une fonction qui retourne le même `GenerationResult`. Toute nouvelle
 sortie doit être contrôlée par `inspect_mission()` avant d'être proposée au
 transfert.
 
+Le flux de découpage utilise `generate_route_polygon()` pour conserver les
+frontières des passes, `plan_mission_split()` pour affecter les batteries, puis
+`generate_mission_parts()` pour publier et valider atomiquement les KMZ.
+
 ## Tests
 
 Depuis `Projet_Drone_Gascogne/` avec l'environnement virtuel voisin :
@@ -417,6 +452,9 @@ Les tests couvrent notamment :
 - les paramètres et polygones invalides ;
 - les distances, durées, profils batterie et réserves de sécurité ;
 - l'estimation complète avec Home et partielle sans Home ;
+- le découpage par passes et la coupure interne utilisée uniquement en secours ;
+- le recalcul des transits, l'affectation unique des batteries et les marges ;
+- la génération, la validation et la restauration des KMZ multiples ;
 - la détection d'une cadence photo trop rapide ;
 - le rejet d'un contour auto-intersecté ;
 - les protections contre les archives dangereuses ;
@@ -430,6 +468,7 @@ Les tests couvrent notamment :
 - l'indexation cadastrale sans réseau ;
 - la recherche par référence et par clic ;
 - la fusion des parcelles adjacentes et le refus des parcelles séparées.
+- la coexistence des bases Gironde et Landes et leur routage automatique.
 
 Les tests de transfert utilisent un faux stockage local et ne modifient pas une
 vraie radiocommande.
@@ -481,9 +520,9 @@ carte. Nominatim peut aussi limiter temporairement les requêtes.
 
 ### Les données cadastrales ne sont pas installées
 
-Cliquer sur `Installer les données cadastrales`, vérifier la connexion Internet
-et conserver au moins 3 Go libres pendant l'opération. L'installation utilise le
-fichier officiel des parcelles de Gironde publié sur cadastre.data.gouv.fr.
+Cliquer sur le bouton d'installation de la Gironde ou des Landes, vérifier la
+connexion Internet et conserver au moins 3 Go libres pendant l'opération.
+L'installation utilise les fichiers officiels publiés sur cadastre.data.gouv.fr.
 
 ### Une parcelle n'est pas trouvée au clic
 
@@ -516,7 +555,7 @@ la cible a été restaurée, puis ouvrir DJI Fly avant toute nouvelle tentative.
 
 ## Limites actuelles
 
-- données cadastrales limitées au département de la Gironde ;
+- données cadastrales limitées aux départements de la Gironde et des Landes ;
 - seules les parcelles adjacentes formant un polygone continu sans trou sont acceptées ;
 - carte et géocodage dépendants d'Internet ;
 - génération limitée à un balayage horizontal ;
@@ -527,5 +566,6 @@ la cible a été restaurée, puis ouvrir DJI Fly avant toute nouvelle tentative.
 - l'autonomie reste une estimation préalable : elle ne remplace pas les alertes
   de DJI Fly ni la vérification de la météo et de l'état réel des batteries ;
 - le Home est pris en compte dans la durée mais n'optimise pas encore la trajectoire ;
-- le changement de batterie est signalé mais la mission n'est pas découpée automatiquement ;
+- le découpage produit plusieurs KMZ qui doivent être transférés un par un vers
+  des missions brouillon DJI Fly distinctes ;
 - la trajectoire doit être inspectée dans DJI Fly avant utilisation.

@@ -1,10 +1,11 @@
-"""Téléchargement, indexation et sélection du cadastre officiel de Gironde."""
+"""Téléchargement, indexation et sélection des cadastres départementaux."""
 
 from __future__ import annotations
 
 import gzip
 import hashlib
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -18,14 +19,9 @@ from pathlib import Path
 from typing import Callable
 
 
-URL_PARCELLES_GIRONDE = (
-    "https://cadastre.data.gouv.fr/data/etalab-cadastre/latest/geojson/"
-    "departements/33/cadastre-33-parcelles.json.gz"
-)
-TAILLE_TELECHARGEMENT_ESTIMEE = 235_520_575
 ESPACE_LIBRE_MINIMUM = 3_000_000_000
 VERSION_SCHEMA = "1"
-NOMBRE_MINIMUM_PARCELLES_GIRONDE = 100_000
+VERSION_CONTROLE_GEOMETRIQUE = "1"
 MAX_PARCELLES_SELECTIONNEES = 50
 MAX_SOMMETS_CONTOUR = 5_000
 Progression = Callable[[str, int], None]
@@ -33,6 +29,54 @@ Progression = Callable[[str, int], None]
 
 class ErreurCadastre(RuntimeError):
     """Les données cadastrales ne peuvent pas être installées ou interrogées."""
+
+
+@dataclass(frozen=True)
+class ConfigurationCadastre:
+    code: str
+    nom: str
+    taille_archive_estimee: int
+    nombre_minimum_parcelles: int
+
+    @property
+    def libelle(self) -> str:
+        return f"{self.nom} ({self.code})"
+
+    @property
+    def url(self) -> str:
+        return (
+            "https://cadastre.data.gouv.fr/data/etalab-cadastre/latest/geojson/"
+            f"departements/{self.code}/cadastre-{self.code}-parcelles.json.gz"
+        )
+
+    @property
+    def nom_archive(self) -> str:
+        return f"cadastre-{self.code}-parcelles.json.gz"
+
+    @property
+    def nom_base(self) -> str:
+        return f"cadastre_{self.nom.casefold()}.sqlite"
+
+
+CADASTRE_GIRONDE = ConfigurationCadastre(
+    code="33",
+    nom="Gironde",
+    taille_archive_estimee=235_520_575,
+    nombre_minimum_parcelles=100_000,
+)
+CADASTRE_LANDES = ConfigurationCadastre(
+    code="40",
+    nom="Landes",
+    taille_archive_estimee=133_837_160,
+    nombre_minimum_parcelles=100_000,
+)
+CONFIGURATIONS_CADASTRALES = (CADASTRE_GIRONDE, CADASTRE_LANDES)
+
+# Alias conservés pour les utilisateurs de l'ancienne API Gironde.
+URL_PARCELLES_GIRONDE = CADASTRE_GIRONDE.url
+URL_PARCELLES_LANDES = CADASTRE_LANDES.url
+TAILLE_TELECHARGEMENT_ESTIMEE = CADASTRE_GIRONDE.taille_archive_estimee
+NOMBRE_MINIMUM_PARCELLES_GIRONDE = CADASTRE_GIRONDE.nombre_minimum_parcelles
 
 
 def repertoire_cadastre_par_defaut() -> Path:
@@ -74,6 +118,12 @@ class ParcelleCadastrale:
     arpentee: bool
     date_mise_a_jour: str
     geometrie_wkb: bytes
+    code_departement: str = ""
+    nom_departement: str = ""
+
+    @property
+    def cle(self) -> str:
+        return f"{self.code_departement}:{self.identifiant}"
 
     @property
     def reference(self) -> str:
@@ -86,7 +136,12 @@ class ParcelleCadastrale:
     @property
     def description(self) -> str:
         surface = f"{self.contenance:,}".replace(",", " ")
-        return f"{self.reference} — {surface} m²"
+        departement = (
+            f"{self.nom_departement} ({self.code_departement}) — "
+            if self.code_departement and self.nom_departement
+            else ""
+        )
+        return f"{departement}{self.reference} — {surface} m²"
 
     def geometrie_geojson(self) -> dict:
         _ijson, _Point, mapping, _shape, _union, _valid, _dumps, loads = (
@@ -107,6 +162,17 @@ def _normaliser_numero(numero: str) -> str:
     if not nettoye:
         return ""
     return nettoye.lstrip("0") or "0"
+
+
+def _geometrie_exploitable(geometrie) -> bool:
+    min_lon, min_lat, max_lon, max_lat = geometrie.bounds
+    return (
+        all(math.isfinite(value) for value in geometrie.bounds)
+        and min_lon < max_lon
+        and min_lat < max_lat
+        and math.isfinite(float(geometrie.area))
+        and geometrie.area > 0
+    )
 
 
 def _emettre(progression: Progression | None, message: str, pourcentage: int) -> None:
@@ -146,13 +212,21 @@ def _sha256_fichier(path: Path) -> str:
 
 
 def _archive_reutilisable(path: Path) -> bool:
-    if not path.is_file() or path.stat().st_size != TAILLE_TELECHARGEMENT_ESTIMEE:
+    if not path.is_file() or path.stat().st_size < 1_000_000:
         return False
     try:
         with gzip.open(path, "rb") as archive:
             return archive.read(1) in {b"{", b"["}
     except (EOFError, OSError, gzip.BadGzipFile):
         return False
+
+
+def _verifier_espace_disque(repertoire: Path, nom_departement: str) -> None:
+    if shutil.disk_usage(repertoire).free < ESPACE_LIBRE_MINIMUM:
+        raise ErreurCadastre(
+            f"Espace disque insuffisant pour installer le cadastre de {nom_departement}. "
+            "Libérez au moins 3 Go."
+        )
 
 
 def _resoudre_url_source(url: str) -> str:
@@ -180,7 +254,7 @@ def _verrou_installation(path: Path):
             fcntl.flock(verrou.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise ErreurCadastre(
-                "Une autre instance installe déjà les données cadastrales de Gironde."
+                "Une autre instance installe déjà des données cadastrales."
             ) from exc
         try:
             yield
@@ -191,17 +265,14 @@ def _verrou_installation(path: Path):
 def telecharger_archive(
     destination: Path,
     *,
-    url: str = URL_PARCELLES_GIRONDE,
+    configuration: ConfigurationCadastre = CADASTRE_GIRONDE,
+    url: str | None = None,
     progression: Progression | None = None,
 ) -> tuple[str, str]:
     """Télécharge l'archive dans un fichier temporaire puis la valide."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    espace_libre = shutil.disk_usage(destination.parent).free
-    if espace_libre < ESPACE_LIBRE_MINIMUM:
-        raise ErreurCadastre(
-            "Espace disque insuffisant pour installer le cadastre de Gironde. "
-            "Libérez au moins 3 Go."
-        )
+    _verifier_espace_disque(destination.parent, configuration.nom)
+    url = url or configuration.url
     temporaire = _chemin_temporaire(
         destination.parent,
         f".{destination.name}.",
@@ -220,10 +291,10 @@ def telecharger_archive(
                 sortie.write(bloc)
                 empreinte.update(bloc)
                 telecharge += len(bloc)
-                reference = taille or TAILLE_TELECHARGEMENT_ESTIMEE
+                reference = taille or configuration.taille_archive_estimee
                 _emettre(
                     progression,
-                    f"Téléchargement du cadastre : {telecharge / 1_000_000:.0f} Mo",
+                    f"Téléchargement {configuration.nom} : {telecharge / 1_000_000:.0f} Mo",
                     int(45 * telecharge / reference),
                 )
             sortie.flush()
@@ -249,7 +320,9 @@ def telecharger_archive(
         temporaire.unlink(missing_ok=True)
         if isinstance(exc, ErreurCadastre):
             raise
-        raise ErreurCadastre(f"Impossible de télécharger le cadastre de Gironde : {exc}") from exc
+        raise ErreurCadastre(
+            f"Impossible de télécharger le cadastre de {configuration.nom} : {exc}"
+        ) from exc
     except BaseException:
         temporaire.unlink(missing_ok=True)
         raise
@@ -259,12 +332,14 @@ def construire_base_depuis_archive(
     archive: Path,
     destination: Path,
     *,
-    url_source: str = URL_PARCELLES_GIRONDE,
+    configuration: ConfigurationCadastre = CADASTRE_GIRONDE,
+    url_source: str | None = None,
     sha256_archive: str = "",
     progression: Progression | None = None,
     nombre_minimum: int = 1,
 ) -> int:
     """Convertit le GeoJSON compressé en SQLite sans le charger en mémoire."""
+    url_source = url_source or configuration.url
     ijson, _Point, _mapping, shape, _union, make_valid, dumps, _loads = (
         _dependances_geometriques()
     )
@@ -276,6 +351,7 @@ def construire_base_depuis_archive(
     )
     connexion = sqlite3.connect(temporaire)
     nombre = 0
+    geometries_rejetees = 0
     try:
         connexion.executescript(
             """
@@ -334,11 +410,20 @@ def construire_base_depuis_archive(
             for feature in ijson.items(flux, "features.item", use_float=True):
                 proprietes = feature.get("properties") or {}
                 identifiant = str(proprietes.get("id") or feature.get("id") or "").strip()
+                commune = str(proprietes.get("commune") or "").strip()
                 geometrie_source = feature.get("geometry")
                 if not identifiant or not geometrie_source:
                     continue
+                if commune and not commune.startswith(configuration.code):
+                    raise ErreurCadastre(
+                        f"L'archive contient la commune {commune}, incompatible avec "
+                        f"le département {configuration.libelle}."
+                    )
                 geometrie = shape(geometrie_source)
                 if geometrie.is_empty or geometrie.geom_type not in {"Polygon", "MultiPolygon"}:
+                    continue
+                if not _geometrie_exploitable(geometrie):
+                    geometries_rejetees += 1
                     continue
                 min_lon, min_lat, max_lon, max_lat = geometrie.bounds
                 nombre += 1
@@ -346,7 +431,7 @@ def construire_base_depuis_archive(
                     (
                         nombre,
                         identifiant,
-                        str(proprietes.get("commune") or ""),
+                        commune,
                         str(proprietes.get("prefixe") or "000"),
                         str(proprietes.get("section") or "").upper(),
                         _normaliser_numero(str(proprietes.get("numero") or "")),
@@ -368,6 +453,14 @@ def construire_base_depuis_archive(
                         min(98, 45 + nombre // 30_000),
                     )
         enregistrer_lot()
+        if geometries_rejetees and (
+            nombre == 0 or geometries_rejetees > max(100, nombre // 1000)
+        ):
+            raise ErreurCadastre(
+                f"Indexation refusée : {geometries_rejetees:,} géométries cadastrales "
+                "sont aplaties ou ont perdu la précision de leurs coordonnées."
+                .replace(",", " ")
+            )
         if nombre < nombre_minimum:
             raise ErreurCadastre(
                 f"Base cadastrale incomplète : {nombre:,} parcelles valides, "
@@ -381,11 +474,14 @@ def construire_base_depuis_archive(
             "INSERT INTO metadonnees(cle, valeur) VALUES (?, ?)",
             (
                 ("version_schema", VERSION_SCHEMA),
-                ("departement", "Gironde (33)"),
+                ("version_controle_geometrique", VERSION_CONTROLE_GEOMETRIQUE),
+                ("code_departement", configuration.code),
+                ("departement", configuration.libelle),
                 ("version_donnees", version_donnees),
                 ("url_source", url_source),
                 ("sha256_archive", sha256_archive),
                 ("nombre_parcelles", str(nombre)),
+                ("geometries_rejetees", str(geometries_rejetees)),
             ),
         )
         connexion.execute(
@@ -399,15 +495,36 @@ def construire_base_depuis_archive(
             integrite = verification.execute("PRAGMA quick_check").fetchone()[0]
             parcelles = verification.execute("SELECT COUNT(*) FROM parcelles").fetchone()[0]
             indexees = verification.execute("SELECT COUNT(*) FROM index_spatial").fetchone()[0]
+            indexees_valides = verification.execute(
+                "SELECT COUNT(*) FROM index_spatial "
+                "WHERE min_longitude < max_longitude AND min_latitude < max_latitude"
+            ).fetchone()[0]
             schema = verification.execute(
                 "SELECT valeur FROM metadonnees WHERE cle='version_schema'"
             ).fetchone()
-        if integrite != "ok" or parcelles != nombre or indexees != nombre:
+            echantillon_wkb = verification.execute(
+                "SELECT geometrie FROM parcelles ORDER BY id LIMIT 3"
+            ).fetchall()
+        if (
+            integrite != "ok"
+            or parcelles != nombre
+            or indexees != nombre
+            or indexees_valides != nombre
+        ):
             raise ErreurCadastre(
-                "La base cadastrale construite n'a pas passé le contrôle d'intégrité."
+                "La base cadastrale construite n'a pas passé le contrôle d'intégrité "
+                "des géométries et de l'index spatial."
             )
         if not schema or schema[0] != VERSION_SCHEMA:
             raise ErreurCadastre("La version de la base cadastrale est invalide.")
+        if len(echantillon_wkb) != min(3, nombre) or any(
+            not _geometrie_exploitable(_loads(bytes(ligne[0])))
+            for ligne in echantillon_wkb
+        ):
+            raise ErreurCadastre(
+                "La précision des géométries cadastrales a été perdue pendant "
+                "l'écriture de la base."
+            )
         _synchroniser_fichier(temporaire)
         os.replace(temporaire, destination)
         _synchroniser_repertoire(destination.parent)
@@ -419,12 +536,17 @@ def construire_base_depuis_archive(
         raise
 
 
-class CadastreGironde:
-    """Accès en lecture à la base cadastrale locale et gestion de son installation."""
+class CadastreDepartement:
+    """Accès en lecture à une base cadastrale locale départementale."""
 
-    def __init__(self, repertoire: Path | None = None) -> None:
+    def __init__(
+        self,
+        configuration: ConfigurationCadastre,
+        repertoire: Path | None = None,
+    ) -> None:
+        self.configuration = configuration
         self.repertoire = (repertoire or repertoire_cadastre_par_defaut()).expanduser().resolve()
-        self.base = self.repertoire / "cadastre_gironde.sqlite"
+        self.base = self.repertoire / configuration.nom_base
 
     @property
     def est_installe(self) -> bool:
@@ -434,7 +556,19 @@ class CadastreGironde:
             informations = self.informations()
         except (OSError, sqlite3.DatabaseError):
             return False
-        return informations.get("version_schema") == VERSION_SCHEMA
+        if informations.get("version_schema") != VERSION_SCHEMA:
+            return False
+        code = informations.get("code_departement")
+        controle = informations.get("version_controle_geometrique")
+        if controle != VERSION_CONTROLE_GEOMETRIQUE:
+            return (
+                code is None
+                and self.configuration.code == CADASTRE_GIRONDE.code
+                and informations.get("departement") == CADASTRE_GIRONDE.libelle
+            )
+        if code is not None:
+            return code == self.configuration.code
+        return informations.get("departement") == self.configuration.libelle
 
     def informations(self) -> dict[str, str]:
         if not self.base.is_file():
@@ -445,43 +579,52 @@ class CadastreGironde:
     def installer(self, progression: Progression | None = None) -> int:
         self.repertoire.mkdir(parents=True, exist_ok=True)
         with _verrou_installation(self.repertoire / "installation.lock"):
-            for temporaire in self.repertoire.glob(".cadastre_gironde.sqlite.*.part"):
+            _verifier_espace_disque(self.repertoire, self.configuration.nom)
+            for temporaire in self.repertoire.glob(f".{self.base.name}.*.part"):
                 temporaire.unlink(missing_ok=True)
-            archive = self.repertoire / "cadastre-33-parcelles.json.gz"
+            archive = self.repertoire / self.configuration.nom_archive
             if _archive_reutilisable(archive):
                 _emettre(
                     progression,
                     "Archive complète déjà présente, reprise de l'indexation.",
                     45,
                 )
-                url_finale = _resoudre_url_source(URL_PARCELLES_GIRONDE)
+                url_finale = _resoudre_url_source(self.configuration.url)
                 empreinte = _sha256_fichier(archive)
             else:
                 archive.unlink(missing_ok=True)
-                url_finale, empreinte = telecharger_archive(archive, progression=progression)
-            resultat = construire_base_depuis_archive(
-                archive,
-                self.base,
-                url_source=url_finale,
-                sha256_archive=empreinte,
-                progression=progression,
-                nombre_minimum=NOMBRE_MINIMUM_PARCELLES_GIRONDE,
-            )
+                url_finale, empreinte = telecharger_archive(
+                    archive,
+                    configuration=self.configuration,
+                    progression=progression,
+                )
+            try:
+                resultat = construire_base_depuis_archive(
+                    archive,
+                    self.base,
+                    configuration=self.configuration,
+                    url_source=url_finale,
+                    sha256_archive=empreinte,
+                    progression=progression,
+                    nombre_minimum=self.configuration.nombre_minimum_parcelles,
+                )
+            except BaseException:
+                archive.unlink(missing_ok=True)
+                raise
             archive.unlink(missing_ok=True)
             return resultat
 
     def _connexion(self) -> sqlite3.Connection:
         if not self.est_installe:
             raise ErreurCadastre(
-                "Les données cadastrales de Gironde ne sont pas installées. "
+                f"Les données cadastrales de {self.configuration.nom} ne sont pas installées. "
                 "Cliquez sur « Installer les données cadastrales »."
             )
         connexion = sqlite3.connect(f"file:{self.base}?mode=ro", uri=True)
         connexion.row_factory = sqlite3.Row
         return connexion
 
-    @staticmethod
-    def _parcelle(ligne: sqlite3.Row) -> ParcelleCadastrale:
+    def _parcelle(self, ligne: sqlite3.Row) -> ParcelleCadastrale:
         return ParcelleCadastrale(
             identifiant=ligne["identifiant"],
             commune=ligne["commune"],
@@ -492,6 +635,8 @@ class CadastreGironde:
             arpentee=bool(ligne["arpentee"]),
             date_mise_a_jour=ligne["date_mise_a_jour"],
             geometrie_wkb=bytes(ligne["geometrie"]),
+            code_departement=self.configuration.code,
+            nom_departement=self.configuration.nom,
         )
 
     def rechercher_reference(
@@ -509,6 +654,11 @@ class CadastreGironde:
             raise ErreurCadastre(
                 "Renseignez le code INSEE de la commune, la section et le numéro de parcelle."
             )
+        if not commune.startswith(self.configuration.code):
+            raise ErreurCadastre(
+                f"La commune {commune} n'appartient pas au département "
+                f"{self.configuration.libelle}."
+            )
         requete = "SELECT * FROM parcelles WHERE commune=? AND section=? AND numero=?"
         valeurs: list[str] = [commune, section, numero]
         if prefixe:
@@ -525,7 +675,9 @@ class CadastreGironde:
             )
         return self._parcelle(lignes[0])
 
-    def rechercher_point(self, latitude: float, longitude: float) -> ParcelleCadastrale:
+    def trouver_point(
+        self, latitude: float, longitude: float
+    ) -> ParcelleCadastrale | None:
         _ijson, Point, _mapping, _shape, _union, _valid, _dumps, loads = (
             _dependances_geometriques()
         )
@@ -544,12 +696,102 @@ class CadastreGironde:
         strictes = [ligne for ligne, geometrie in candidates if geometrie.contains(point)]
         retenues = strictes or [ligne for ligne, geometrie in candidates if geometrie.covers(point)]
         if not retenues:
-            raise ErreurCadastre("Aucune parcelle cadastrale n'a été trouvée à cet endroit.")
+            return None
         if len(retenues) > 1:
             raise ErreurCadastre(
                 "Le clic se trouve sur une limite cadastrale. Cliquez davantage au centre de la parcelle."
             )
         return self._parcelle(retenues[0])
+
+    def rechercher_point(self, latitude: float, longitude: float) -> ParcelleCadastrale:
+        parcelle = self.trouver_point(latitude, longitude)
+        if parcelle is None:
+            raise ErreurCadastre("Aucune parcelle cadastrale n'a été trouvée à cet endroit.")
+        return parcelle
+
+
+class CadastreGironde(CadastreDepartement):
+    def __init__(self, repertoire: Path | None = None) -> None:
+        super().__init__(CADASTRE_GIRONDE, repertoire)
+
+
+class CadastreLandes(CadastreDepartement):
+    def __init__(self, repertoire: Path | None = None) -> None:
+        super().__init__(CADASTRE_LANDES, repertoire)
+
+
+class CadastresRegionaux:
+    """Route automatiquement les recherches vers les cadastres installés."""
+
+    def __init__(
+        self,
+        cadastres: tuple[CadastreDepartement, ...] | None = None,
+    ) -> None:
+        self.cadastres = cadastres or (CadastreGironde(), CadastreLandes())
+
+    @property
+    def installes(self) -> tuple[CadastreDepartement, ...]:
+        return tuple(cadastre for cadastre in self.cadastres if cadastre.est_installe)
+
+    def cadastre_pour_commune(self, commune: str) -> CadastreDepartement:
+        commune = commune.strip()
+        cadastre = next(
+            (
+                item
+                for item in self.cadastres
+                if commune.startswith(item.configuration.code)
+            ),
+            None,
+        )
+        if cadastre is None:
+            codes = ", ".join(item.configuration.code for item in self.cadastres)
+            raise ErreurCadastre(
+                f"Le code commune {commune or 'vide'} n'appartient pas aux "
+                f"départements pris en charge ({codes})."
+            )
+        if not cadastre.est_installe:
+            raise ErreurCadastre(
+                f"Le code commune {commune} appartient à {cadastre.configuration.libelle}. "
+                f"Installez d'abord les données cadastrales de {cadastre.configuration.nom}."
+            )
+        return cadastre
+
+    def rechercher_reference(
+        self,
+        commune: str,
+        section: str,
+        numero: str,
+        prefixe: str = "",
+    ) -> ParcelleCadastrale:
+        return self.cadastre_pour_commune(commune).rechercher_reference(
+            commune,
+            section,
+            numero,
+            prefixe,
+        )
+
+    def rechercher_point(self, latitude: float, longitude: float) -> ParcelleCadastrale:
+        installes = self.installes
+        if not installes:
+            raise ErreurCadastre(
+                "Installez les données cadastrales de Gironde ou des Landes avant "
+                "de sélectionner une parcelle."
+            )
+        trouvees = [
+            parcelle
+            for cadastre in installes
+            if (parcelle := cadastre.trouver_point(latitude, longitude)) is not None
+        ]
+        if not trouvees:
+            raise ErreurCadastre(
+                "Aucune parcelle n'a été trouvée dans les cadastres installés à cet endroit."
+            )
+        if len(trouvees) > 1:
+            raise ErreurCadastre(
+                "Le clic correspond à plusieurs départements. Cliquez davantage au "
+                "centre de la parcelle."
+            )
+        return trouvees[0]
 
 
 def fusionner_parcelles(parcelles: list[ParcelleCadastrale]) -> ResultatFusion:
@@ -600,10 +842,11 @@ def collection_geojson(parcelles: list[ParcelleCadastrale]) -> dict:
         "features": [
             {
                 "type": "Feature",
-                "id": parcelle.identifiant,
+                "id": parcelle.cle,
                 "properties": {
                     "référence": parcelle.reference,
                     "contenance_m²": parcelle.contenance,
+                    "département": parcelle.code_departement,
                 },
                 "geometry": parcelle.geometrie_geojson(),
             }

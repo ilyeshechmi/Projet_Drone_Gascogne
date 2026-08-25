@@ -14,8 +14,10 @@ try:
         DetectedMission,
         DetectionWorker,
         TransferWorker,
+        split_plan_summary,
         _relative_remote_target,
     )
+    from prog_vol.autonomy import BatteryProfile, BatteryState, plan_mission_split
     from prog_vol.missions import inspect_mission
     from prog_vol.mtp import MountedStorage
     from prog_vol.transfer import build_transfer_plan
@@ -40,6 +42,29 @@ def create_mission(path: Path, marker: str) -> None:
 
 
 class GuiServiceTests(unittest.TestCase):
+    def test_split_summary_lists_parts_batteries_and_mid_pass_warning(self) -> None:
+        waypoints = (
+            (44.8000, -0.6000, 30.0),
+            (44.8000, -0.5900, 30.0),
+            (44.8001, -0.6000, 30.0),
+            (44.8001, -0.5900, 30.0),
+        )
+        profile = BatteryProfile("Test", 1000, 1, 210)
+        plan = plan_mission_split(
+            waypoints,
+            (4,),
+            10,
+            (BatteryState("B1", profile), BatteryState("B2", profile)),
+            home_point=waypoints[0][:2],
+            reserve_percent=0,
+        )
+
+        summary = split_plan_summary(plan)
+
+        self.assertIn("Partie 1/2", summary)
+        self.assertIn("B1", summary)
+        self.assertIn("milieu de passe", summary)
+
     def test_remote_target_is_decoded_once(self) -> None:
         relative = _relative_remote_target(
             "libmtp://00010001/Android/data/dji.go.v5/files/waypoint",

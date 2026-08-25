@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import math
+import os
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from .autonomy import FlightEstimate, estimate_flight, geographic_distance_m
+from .autonomy import (
+    FlightEstimate,
+    MissionSplitPlan,
+    estimate_flight,
+    geographic_distance_m,
+)
+from .missions import inspect_mission
 
 
 MAX_WAYPOINTS = 20_000
@@ -65,6 +73,38 @@ class GenerationResult:
     @property
     def waypoint_count(self) -> int:
         return len(self.waypoints)
+
+
+@dataclass(frozen=True)
+class PassRange:
+    start_index: int
+    end_index: int
+
+
+@dataclass(frozen=True)
+class GeneratedRoute:
+    waypoints: tuple[tuple[float, float, float], ...]
+    passes: tuple[PassRange, ...]
+    fov_width: float
+    fov_height: float
+
+    @property
+    def line_count(self) -> int:
+        return len(self.passes)
+
+    @property
+    def pass_end_indices(self) -> tuple[int, ...]:
+        return tuple(item.end_index for item in self.passes)
+
+
+@dataclass(frozen=True)
+class MissionGenerationSet:
+    results: tuple[GenerationResult, ...]
+    split_plan: MissionSplitPlan
+
+    @property
+    def output_paths(self) -> tuple[Path, ...]:
+        return tuple(result.output_path for result in self.results)
 
 
 def point_in_polygon(point: tuple[float, float], polygon: list[tuple[float, float]]) -> bool:
@@ -129,10 +169,10 @@ def _polygon_self_intersects(polygon: list[tuple[float, float]]) -> bool:
     return False
 
 
-def generate_waypoints_polygon(
+def generate_route_polygon(
     polygon_points: list[tuple[float, float]] | list[list[float]],
     parameters: MissionParameters,
-) -> tuple[list[tuple[float, float, float]], int, float, float]:
+) -> GeneratedRoute:
     """Couvre un polygone par des lignes horizontales en boustrophédon."""
     parameters.validate()
     polygon = [(float(latitude), float(longitude)) for latitude, longitude in polygon_points]
@@ -156,6 +196,7 @@ def generate_waypoints_polygon(
     line_total = max(1, math.ceil(height_degrees / line_spacing_degrees)) + 1
 
     waypoints: list[tuple[float, float, float]] = []
+    passes: list[PassRange] = []
     generated_lines = 0
     for line_index in range(line_total):
         latitude = min_lat + line_index * line_spacing_degrees
@@ -198,14 +239,25 @@ def generate_waypoints_polygon(
                         f"La mission dépasse la limite de sécurité de {MAX_WAYPOINTS} "
                         "waypoints. Réduisez la zone ou le recouvrement."
                     )
+                start_index = len(waypoints)
                 waypoints.extend(line_waypoints)
+                passes.append(PassRange(start_index, len(waypoints)))
                 generated_lines += 1
 
     if not waypoints:
         raise GenerationError(
             "Aucun waypoint n'a été généré. Vérifiez la forme et la taille du polygone."
         )
-    return waypoints, generated_lines, fov_width, fov_height
+    return GeneratedRoute(tuple(waypoints), tuple(passes), fov_width, fov_height)
+
+
+def generate_waypoints_polygon(
+    polygon_points: list[tuple[float, float]] | list[list[float]],
+    parameters: MissionParameters,
+) -> tuple[list[tuple[float, float, float]], int, float, float]:
+    """Interface historique retournant la trajectoire sous forme de liste plate."""
+    route = generate_route_polygon(polygon_points, parameters)
+    return list(route.waypoints), route.line_count, route.fov_width, route.fov_height
 
 
 def _heading(index: int, waypoints: list[tuple[float, float, float]]) -> int:
@@ -229,11 +281,14 @@ def generate_waypointmap_kmz(
     *,
     route_distance_m: float | None = None,
     route_duration_s: float | None = None,
+    finish_action: str = "goHome",
 ) -> Path:
     """Crée l'archive WPMZ attendue par DJI Fly et WaypointMap."""
     parameters.validate()
     if not waypoints:
         raise GenerationError("Une mission KMZ doit contenir au moins un waypoint.")
+    if finish_action not in {"goHome", "noAction", "autoLand", "gotoFirstWaypoint"}:
+        raise GenerationError("Action de fin WPML non prise en charge.")
     if route_distance_m is None or route_duration_s is None:
         route_estimate = estimate_flight(
             waypoints,
@@ -256,7 +311,7 @@ def generate_waypointmap_kmz(
 <wpml:updateTime>{timestamp}</wpml:updateTime>
 <wpml:missionConfig>
 <wpml:flyToWaylineMode>safely</wpml:flyToWaylineMode>
-<wpml:finishAction>noAction</wpml:finishAction>
+<wpml:finishAction>{finish_action}</wpml:finishAction>
 <wpml:exitOnRCLost>executeLostAction</wpml:exitOnRCLost>
 <wpml:executeRCLostAction>hover</wpml:executeRCLostAction>
 <wpml:globalTransitionalSpeed>{parameters.drone_speed}</wpml:globalTransitionalSpeed>
@@ -369,7 +424,7 @@ def generate_waypointmap_kmz(
 <Document>
 <wpml:missionConfig>
 <wpml:flyToWaylineMode>safely</wpml:flyToWaylineMode>
-<wpml:finishAction>noAction</wpml:finishAction>
+<wpml:finishAction>{finish_action}</wpml:finishAction>
 <wpml:exitOnRCLost>executeLostAction</wpml:exitOnRCLost>
 <wpml:executeRCLostAction>hover</wpml:executeRCLostAction>
 <wpml:globalTransitionalSpeed>{parameters.drone_speed}</wpml:globalTransitionalSpeed>
@@ -408,18 +463,18 @@ def generate_mission(
     home_point: tuple[float, float] | None = None,
 ) -> GenerationResult:
     """Point d'entrée stable utilisé par l'interface graphique."""
-    waypoints, line_count, fov_width, fov_height = generate_waypoints_polygon(
+    route = generate_route_polygon(
         polygon_points,
         parameters,
     )
     flight_estimate = estimate_flight(
-        waypoints,
+        route.waypoints,
         parameters.drone_speed,
         home_point=home_point,
         photo_interval_s=parameters.photo_interval,
     )
     path = generate_waypointmap_kmz(
-        waypoints,
+        list(route.waypoints),
         parameters,
         output_path,
         route_distance_m=flight_estimate.route_distance_m,
@@ -427,9 +482,105 @@ def generate_mission(
     )
     return GenerationResult(
         output_path=path,
-        waypoints=tuple(waypoints),
-        line_count=line_count,
-        fov_width=fov_width,
-        fov_height=fov_height,
+        waypoints=route.waypoints,
+        line_count=route.line_count,
+        fov_width=route.fov_width,
+        fov_height=route.fov_height,
         flight_estimate=flight_estimate,
     )
+
+
+def _part_output_paths(output_path: str | Path, part_count: int) -> tuple[Path, ...]:
+    base = Path(output_path).expanduser().resolve()
+    if base.suffix.casefold() != ".kmz":
+        base = base.with_suffix(".kmz")
+    if part_count == 1:
+        return (base,)
+    return tuple(
+        base.with_name(
+            f"{base.stem}_partie_{part_number:02d}_sur_{part_count:02d}.kmz"
+        )
+        for part_number in range(1, part_count + 1)
+    )
+
+
+def generate_mission_parts(
+    route: GeneratedRoute,
+    parameters: MissionParameters,
+    output_path: str | Path,
+    split_plan: MissionSplitPlan,
+) -> MissionGenerationSet:
+    """Génère et valide toutes les parties avant de publier les fichiers finaux."""
+    if not split_plan.possible or not split_plan.parts:
+        raise GenerationError(split_plan.reason)
+    covered = tuple(
+        waypoint for part in split_plan.parts for waypoint in part.waypoints
+    )
+    if covered != route.waypoints:
+        raise GenerationError(
+            "Le plan de découpage ne couvre pas exactement la trajectoire générée."
+        )
+
+    final_paths = _part_output_paths(output_path, len(split_plan.parts))
+    for path in final_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    temporary_paths = tuple(
+        path.with_name(f".{path.stem}.{token}.tmp.kmz") for path in final_paths
+    )
+    backup_paths: dict[Path, Path] = {}
+    published_paths: set[Path] = set()
+    results: list[GenerationResult] = []
+    try:
+        for part, temporary_path in zip(split_plan.parts, temporary_paths):
+            generate_waypointmap_kmz(
+                list(part.waypoints),
+                parameters,
+                temporary_path,
+                route_distance_m=part.flight_estimate.route_distance_m,
+                route_duration_s=part.flight_estimate.route_duration_s,
+                finish_action="goHome",
+            )
+            inspect_mission(temporary_path)
+
+        for final_path in final_paths:
+            if final_path.exists():
+                backup_path = final_path.with_name(f".{final_path.name}.{token}.bak")
+                os.replace(final_path, backup_path)
+                backup_paths[final_path] = backup_path
+        for temporary_path, final_path in zip(temporary_paths, final_paths):
+            os.replace(temporary_path, final_path)
+            published_paths.add(final_path)
+
+        for part, final_path in zip(split_plan.parts, final_paths):
+            inspect_mission(final_path)
+            line_count = sum(
+                item.start_index < part.end_index
+                and item.end_index > part.start_index
+                for item in route.passes
+            )
+            results.append(
+                GenerationResult(
+                    output_path=final_path,
+                    waypoints=part.waypoints,
+                    line_count=line_count,
+                    fov_width=route.fov_width,
+                    fov_height=route.fov_height,
+                    flight_estimate=part.flight_estimate,
+                )
+            )
+    except Exception:
+        for temporary_path in temporary_paths:
+            temporary_path.unlink(missing_ok=True)
+        for final_path in published_paths:
+            final_path.unlink(missing_ok=True)
+        for final_path, backup_path in backup_paths.items():
+            final_path.unlink(missing_ok=True)
+            if backup_path.exists():
+                os.replace(backup_path, final_path)
+        raise
+    else:
+        for backup_path in backup_paths.values():
+            backup_path.unlink(missing_ok=True)
+
+    return MissionGenerationSet(tuple(results), split_plan)

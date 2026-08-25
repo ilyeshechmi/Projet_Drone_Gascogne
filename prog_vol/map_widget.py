@@ -90,7 +90,7 @@ MAP_HTML = """<!DOCTYPE html>
         return;
       }
       if (modeSelection === 'cadastre') {
-        hint.textContent = 'Mode cadastral : cliquez au centre d’une parcelle de Gironde.';
+        hint.textContent = 'Mode cadastral : cliquez au centre d’une parcelle de Gironde ou des Landes.';
         return;
       }
       if (drawingClosed) {
@@ -212,6 +212,29 @@ MAP_HTML = """<!DOCTYPE html>
           }).addTo(waypointLayer).bindTooltip('WP ' + (index + 1));
         });
         map.fitBounds(path.getBounds(), {padding:[35,35]});
+      },
+      showMissionParts: function(parts) {
+        waypointLayer.clearLayers();
+        const colors = ['#c43d2f', '#147d72', '#7856a8', '#c17b16', '#2368a2', '#9b3f76'];
+        const bounds = [];
+        parts.forEach(function(coordinates, partIndex) {
+          if (!coordinates.length) return;
+          const color = colors[partIndex % colors.length];
+          L.polyline(coordinates, {color:color, weight:3, opacity:.92}).addTo(waypointLayer);
+          coordinates.forEach(function(point, waypointIndex) {
+            bounds.push(point);
+            const marker = L.circleMarker(point, {
+              radius: waypointIndex === 0 || waypointIndex === coordinates.length - 1 ? 5 : 3,
+              color:color, fillColor:color, fillOpacity:1, weight:1
+            }).addTo(waypointLayer);
+            marker.bindTooltip(
+              'Partie ' + (partIndex + 1) + ' — WP ' + (waypointIndex + 1)
+              + (waypointIndex === 0 ? ' — début' : '')
+              + (waypointIndex === coordinates.length - 1 ? ' — fin' : '')
+            );
+          });
+        });
+        if (bounds.length) map.fitBounds(bounds, {padding:[35,35]});
       }
     };
     updateHint();
@@ -346,6 +369,17 @@ class MissionMapWidget(QWidget):
         coordinates = [[latitude, longitude] for latitude, longitude, _ in waypoints]
         payload = json.dumps(coordinates, separators=(",", ":"))
         self._run_script(f"window.kaelMap.showWaypoints({payload});")
+
+    def show_mission_parts(
+        self,
+        parts: tuple[tuple[tuple[float, float, float], ...], ...],
+    ) -> None:
+        coordinates = [
+            [[latitude, longitude] for latitude, longitude, _ in waypoints]
+            for waypoints in parts
+        ]
+        payload = json.dumps(coordinates, separators=(",", ":"))
+        self._run_script(f"window.kaelMap.showMissionParts({payload});")
 
     @pyqtSlot(bool)
     def _load_finished(self, succeeded: bool) -> None:

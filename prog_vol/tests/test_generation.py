@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
+from prog_vol.autonomy import BatteryProfile, BatteryState, plan_mission_split
 from prog_vol.generator import (
+    GeneratedRoute,
     GenerationError,
     MissionParameters,
+    PassRange,
+    generate_mission_parts,
     generate_mission,
+    generate_route_polygon,
     generate_waypoints_polygon,
 )
 from prog_vol.missions import inspect_mission
@@ -23,8 +30,34 @@ POLYGON = [
     (44.8010, -0.6000),
 ]
 
+SPLIT_WAYPOINTS = (
+    (44.8000, -0.6000, 30.0),
+    (44.8000, -0.5900, 30.0),
+    (44.8001, -0.6000, 30.0),
+    (44.8001, -0.5900, 30.0),
+)
+
 
 class GenerationTests(unittest.TestCase):
+    @staticmethod
+    def split_route_and_plan():
+        route = GeneratedRoute(
+            SPLIT_WAYPOINTS,
+            (PassRange(0, 2), PassRange(2, 4)),
+            100,
+            80,
+        )
+        profile = BatteryProfile("Test", 1000, 1, 210)
+        plan = plan_mission_split(
+            route.waypoints,
+            route.pass_end_indices,
+            10,
+            (BatteryState("B1", profile), BatteryState("B2", profile)),
+            home_point=SPLIT_WAYPOINTS[0][:2],
+            reserve_percent=0,
+        )
+        return route, plan
+
     def test_generated_mission_is_accepted_by_transfer_validator(self) -> None:
         parameters = MissionParameters(frontal_overlap=0.6, lateral_overlap=0.6)
         with tempfile.TemporaryDirectory() as directory:
@@ -114,6 +147,90 @@ class GenerationTests(unittest.TestCase):
 
         self.assertNotIn("<wpml:distance>0</wpml:distance>", waylines)
         self.assertNotIn("<wpml:duration>0</wpml:duration>", waylines)
+
+    def test_generated_route_preserves_pass_boundaries(self) -> None:
+        route = generate_route_polygon(
+            POLYGON,
+            MissionParameters(frontal_overlap=0.6, lateral_overlap=0.6),
+        )
+
+        self.assertEqual(route.pass_end_indices[-1], len(route.waypoints))
+        self.assertEqual(route.line_count, len(route.passes))
+        self.assertTrue(all(item.start_index < item.end_index for item in route.passes))
+
+    def test_generates_and_validates_numbered_split_missions(self) -> None:
+        route, plan = self.split_route_and_plan()
+        with tempfile.TemporaryDirectory() as directory:
+            generated = generate_mission_parts(
+                route,
+                MissionParameters(altitude=30, drone_speed=10),
+                Path(directory) / "mission.kmz",
+                plan,
+            )
+            names = [result.output_path.name for result in generated.results]
+            archives = [inspect_mission(result.output_path) for result in generated.results]
+            with zipfile.ZipFile(generated.results[0].output_path) as archive:
+                waylines = archive.read("wpmz/waylines.wpml").decode("utf-8")
+
+        self.assertEqual(
+            names,
+            ["mission_partie_01_sur_02.kmz", "mission_partie_02_sur_02.kmz"],
+        )
+        self.assertEqual([archive.waypoint_count for archive in archives], [2, 2])
+        self.assertIn("<wpml:index>0</wpml:index>", waylines)
+        self.assertIn("<wpml:finishAction>goHome</wpml:finishAction>", waylines)
+
+    def test_split_generation_preserves_existing_files_on_validation_failure(self) -> None:
+        route, plan = self.split_route_and_plan()
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "mission_partie_01_sur_02.kmz"
+            second = Path(directory) / "mission_partie_02_sur_02.kmz"
+            first.write_bytes(b"existing one")
+            second.write_bytes(b"existing two")
+
+            with patch("prog_vol.generator.inspect_mission", side_effect=RuntimeError("invalid")):
+                with self.assertRaises(RuntimeError):
+                    generate_mission_parts(
+                        route,
+                        MissionParameters(altitude=30, drone_speed=10),
+                        Path(directory) / "mission.kmz",
+                        plan,
+                    )
+
+            self.assertEqual(first.read_bytes(), b"existing one")
+            self.assertEqual(second.read_bytes(), b"existing two")
+
+    def test_split_generation_restores_all_files_after_partial_publication(self) -> None:
+        route, plan = self.split_route_and_plan()
+        real_replace = os.replace
+        replace_count = 0
+
+        def fail_during_publication(source, destination):
+            nonlocal replace_count
+            replace_count += 1
+            if replace_count == 4:
+                raise OSError("publication interrupted")
+            return real_replace(source, destination)
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "mission_partie_01_sur_02.kmz"
+            second = Path(directory) / "mission_partie_02_sur_02.kmz"
+            first.write_bytes(b"existing one")
+            second.write_bytes(b"existing two")
+
+            with patch("prog_vol.generator.os.replace", side_effect=fail_during_publication):
+                with self.assertRaises(OSError):
+                    generate_mission_parts(
+                        route,
+                        MissionParameters(altitude=30, drone_speed=10),
+                        Path(directory) / "mission.kmz",
+                        plan,
+                    )
+
+            self.assertEqual(first.read_bytes(), b"existing one")
+            self.assertEqual(second.read_bytes(), b"existing two")
+            self.assertFalse(any(Path(directory).glob(".*.bak")))
+            self.assertFalse(any(Path(directory).glob("*.tmp.kmz")))
 
 
 if __name__ == "__main__":

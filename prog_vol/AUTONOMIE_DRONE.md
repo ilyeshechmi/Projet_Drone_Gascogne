@@ -399,7 +399,7 @@ La batterie ayant la plus grande autonomie sûre est recommandée et la marge es
 marge = T_sûre - T_mission
 ```
 
-#### Niveau orange : réserve non respectée
+#### Proposition de découpage : réserve non respectée
 
 ```text
 aucune batterie n'a T_sûre >= T_mission
@@ -407,30 +407,39 @@ mais une batterie a T_brute >= T_mission
 ```
 
 La mission pourrait théoriquement tenir sur cette batterie, mais elle entamerait
-la charge réservée à l'atterrissage.
+la charge réservée à l'atterrissage. Le programme recherche donc aussi un
+découpage utilisant les batteries déclarées et respectant la réserve.
 
-#### Niveau orange : plusieurs batteries seraient nécessaires
+#### Proposition de découpage : plusieurs batteries nécessaires
 
 ```text
 aucune batterie n'a T_brute >= T_mission
 mais Σ T_sûre >= T_mission
 ```
 
-Les batteries sont classées par autonomie sûre décroissante et additionnées
-jusqu'à atteindre la durée de mission. Le nombre affiché est une **borne
-inférieure**.
+La somme reste un premier indicateur, mais le programme ne la considère plus
+comme une validation. Il recherche des segments contigus et vérifie séparément :
 
-Il ne constitue pas une validation opérationnelle : chaque sortie supplémentaire
-ajoute une montée, un transit, un retour et une descente. Le KMZ actuel reste une
-mission continue. Il doit être découpé avant de changer de batterie.
+```text
+T_partie = T_montée + T_transit_aller + T_zone_partie
+          + T_retour + T_descente
+```
 
-#### Niveau rouge : charge totale insuffisante
+Une batterie physique est utilisée au plus une fois. Les coupures entre passes
+sont prioritaires. Une coupure au milieu d'une passe est autorisée uniquement si
+aucun plan par passes entières n'est réalisable. L'utilisateur valide la
+proposition avant la création des fichiers KMZ séparés. La recherche compare au
+maximum 12 batteries et favorise successivement le plus petit nombre de parties,
+la meilleure marge minimale puis le transit total le plus court.
+
+#### Niveau rouge : découpage impossible
 
 ```text
 Σ T_sûre < T_mission
 ```
 
-La charge déclarée ne permet pas de couvrir la mission avec la réserve demandée.
+La charge déclarée ne permet pas de couvrir la mission avec la réserve demandée,
+ou les surcoûts des sorties supplémentaires rendent tout découpage impossible.
 
 ### 12.2 Estimation sans Home
 
@@ -598,9 +607,11 @@ Cette optimisation est volontairement exclue de la version actuelle.
 
 ### 16.3 Découpage automatique
 
-Pour annoncer précisément plusieurs batteries, il faudra découper la liste des
-waypoints en sous-missions. Chaque sous-mission devra inclure son propre transit,
-sa montée, son retour et sa descente, puis être validée séparément.
+Le programme conserve désormais les frontières des passes et découpe la liste
+des waypoints en sous-missions contiguës. Chaque sous-mission inclut son propre
+transit, sa montée, son retour et sa descente, reçoit une batterie physique, puis
+est générée et validée séparément. L'aperçu utilise une couleur par partie et les
+fichiers sont transférés individuellement vers DJI Fly.
 
 ## 17. Règle opérationnelle finale
 

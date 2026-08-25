@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import gzip
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from prog_vol.cadastre import (
+    CADASTRE_GIRONDE,
+    CADASTRE_LANDES,
     CadastreGironde,
+    CadastreLandes,
+    CadastresRegionaux,
     ErreurCadastre,
     collection_geojson,
     construire_base_depuis_archive,
@@ -23,13 +31,14 @@ def feature(
     numero: str,
     coordonnees: list[list[float]],
     contenance: int,
+    commune: str = "33522",
 ) -> dict:
     return {
         "type": "Feature",
         "id": identifiant,
         "properties": {
             "id": identifiant,
-            "commune": "33522",
+            "commune": commune,
             "prefixe": "000",
             "section": "AB",
             "numero": numero,
@@ -80,6 +89,42 @@ FEATURES = [
         800,
     ),
 ]
+
+FEATURES_LANDES = [
+    feature(
+        "40192000CD0001",
+        "1",
+        [
+            [-0.5000, 43.8900],
+            [-0.4990, 43.8900],
+            [-0.4990, 43.8910],
+            [-0.5000, 43.8910],
+            [-0.5000, 43.8900],
+        ],
+        1500,
+        commune="40192",
+    )
+]
+
+
+def construire_cadastre_test(
+    repertoire: Path,
+    configuration,
+    features: list[dict],
+) -> None:
+    archive = repertoire / f"test-{configuration.code}.json.gz"
+    with gzip.open(archive, "wt", encoding="utf-8") as sortie:
+        json.dump({"type": "FeatureCollection", "features": features}, sortie)
+    construire_base_depuis_archive(
+        archive,
+        repertoire / configuration.nom_base,
+        configuration=configuration,
+        url_source=(
+            "https://cadastre.data.gouv.fr/data/etalab-cadastre/2026-06-01/"
+            f"geojson/departements/{configuration.code}/"
+            f"cadastre-{configuration.code}-parcelles.json.gz"
+        ),
+    )
 
 
 class CadastreTests(unittest.TestCase):
@@ -164,12 +209,15 @@ class CadastreTests(unittest.TestCase):
         proprietes = collection["features"][0]["properties"]
         self.assertIn("référence", proprietes)
         self.assertIn("contenance_m²", proprietes)
+        self.assertEqual(collection["features"][0]["id"], parcelle.cle)
 
     def test_metadonnees_de_la_base(self) -> None:
         informations = self.cadastre.informations()
 
         self.assertTrue(self.cadastre.est_installe)
         self.assertEqual(informations["departement"], "Gironde (33)")
+        self.assertEqual(informations["code_departement"], "33")
+        self.assertEqual(informations["version_controle_geometrique"], "1")
         self.assertEqual(informations["version_donnees"], "2026-06-01")
 
     def test_echec_indexation_conserve_ancienne_base(self) -> None:
@@ -187,6 +235,222 @@ class CadastreTests(unittest.TestCase):
 
         self.assertEqual(self.cadastre.base.read_bytes(), ancienne_base)
         self.assertTrue(self.cadastre.est_installe)
+
+    def test_base_gironde_historique_reste_compatible(self) -> None:
+        with closing(sqlite3.connect(self.cadastre.base)) as connexion:
+            connexion.execute(
+                "DELETE FROM metadonnees WHERE cle IN "
+                "('code_departement', 'version_controle_geometrique')"
+            )
+            connexion.commit()
+
+        self.assertTrue(self.cadastre.est_installe)
+
+    def test_configuration_landes_utilise_des_fichiers_distincts(self) -> None:
+        self.assertEqual(CADASTRE_LANDES.nom_base, "cadastre_landes.sqlite")
+        self.assertIn("departements/40/", CADASTRE_LANDES.url)
+        self.assertNotEqual(CADASTRE_GIRONDE.nom_base, CADASTRE_LANDES.nom_base)
+
+    def test_construit_et_recherche_le_cadastre_des_landes(self) -> None:
+        construire_cadastre_test(
+            self.repertoire,
+            CADASTRE_LANDES,
+            FEATURES_LANDES,
+        )
+        landes = CadastreLandes(self.repertoire)
+
+        parcelle = landes.rechercher_reference("40192", "AB", "1")
+        par_clic = landes.rechercher_point(43.8905, -0.4995)
+
+        self.assertTrue(landes.est_installe)
+        self.assertEqual(parcelle.identifiant, "40192000CD0001")
+        self.assertEqual(par_clic.code_departement, "40")
+        self.assertIn("Landes (40)", parcelle.description)
+        self.assertEqual(landes.informations()["departement"], "Landes (40)")
+
+    def test_gironde_et_landes_coexistent_et_sont_routees_automatiquement(self) -> None:
+        construire_cadastre_test(
+            self.repertoire,
+            CADASTRE_LANDES,
+            FEATURES_LANDES,
+        )
+        landes = CadastreLandes(self.repertoire)
+        regionaux = CadastresRegionaux((self.cadastre, landes))
+
+        gironde = regionaux.rechercher_reference("33522", "AB", "1")
+        lande = regionaux.rechercher_reference("40192", "AB", "1")
+
+        self.assertEqual(regionaux.rechercher_point(44.8005, -0.5995), gironde)
+        self.assertEqual(regionaux.rechercher_point(43.8905, -0.4995), lande)
+        self.assertNotEqual(gironde.cle, lande.cle)
+        self.assertTrue(self.cadastre.base.is_file())
+        self.assertTrue(landes.base.is_file())
+
+    def test_recherche_reference_indique_la_base_landes_manquante(self) -> None:
+        regionaux = CadastresRegionaux((self.cadastre, CadastreLandes(self.repertoire)))
+
+        with self.assertRaisesRegex(ErreurCadastre, "Installez.*Landes"):
+            regionaux.rechercher_reference("40192", "AB", "1")
+
+    def test_clic_ambigu_entre_deux_bases_est_refuse(self) -> None:
+        landes_superposees = [
+            feature(
+                "40192000CD0001",
+                "1",
+                FEATURES[0]["geometry"]["coordinates"][0],
+                1500,
+                commune="40192",
+            )
+        ]
+        construire_cadastre_test(
+            self.repertoire,
+            CADASTRE_LANDES,
+            landes_superposees,
+        )
+        regionaux = CadastresRegionaux(
+            (self.cadastre, CadastreLandes(self.repertoire))
+        )
+
+        with self.assertRaisesRegex(ErreurCadastre, "plusieurs départements"):
+            regionaux.rechercher_point(44.8005, -0.5995)
+
+    def test_archive_d_un_autre_departement_est_refusee(self) -> None:
+        archive = self.repertoire / "mauvais-departement.json.gz"
+        destination = self.repertoire / "mauvais.sqlite"
+        with gzip.open(archive, "wt", encoding="utf-8") as sortie:
+            json.dump(
+                {"type": "FeatureCollection", "features": FEATURES_LANDES},
+                sortie,
+            )
+
+        with self.assertRaisesRegex(ErreurCadastre, "incompatible"):
+            construire_base_depuis_archive(
+                archive,
+                destination,
+                configuration=CADASTRE_GIRONDE,
+            )
+
+        self.assertFalse(destination.exists())
+
+    def test_metadonnee_d_un_mauvais_departement_desactive_la_base(self) -> None:
+        with closing(sqlite3.connect(self.cadastre.base)) as connexion:
+            connexion.execute(
+                "UPDATE metadonnees SET valeur='40' WHERE cle='code_departement'"
+            )
+            connexion.commit()
+
+        self.assertFalse(self.cadastre.est_installe)
+
+    def test_installation_landes_utilise_sa_configuration(self) -> None:
+        landes = CadastreLandes(self.repertoire)
+
+        with (
+            patch(
+                "prog_vol.cadastre.telecharger_archive",
+                return_value=(CADASTRE_LANDES.url, "sha-test"),
+            ) as telecharger,
+            patch(
+                "prog_vol.cadastre.construire_base_depuis_archive",
+                return_value=123,
+            ) as construire,
+        ):
+            nombre = landes.installer()
+
+        self.assertEqual(nombre, 123)
+        self.assertEqual(telecharger.call_args.args[0].name, CADASTRE_LANDES.nom_archive)
+        self.assertIs(
+            telecharger.call_args.kwargs["configuration"],
+            CADASTRE_LANDES,
+        )
+        self.assertEqual(construire.call_args.args[1], landes.base)
+        self.assertIs(
+            construire.call_args.kwargs["configuration"],
+            CADASTRE_LANDES,
+        )
+
+    def test_fusion_accepte_des_parcelles_adjacentes_des_deux_departements(self) -> None:
+        lande_adjacente = [
+            feature(
+                "40192000CD0001",
+                "1",
+                [
+                    [-0.5980, 44.8000],
+                    [-0.5970, 44.8000],
+                    [-0.5970, 44.8010],
+                    [-0.5980, 44.8010],
+                    [-0.5980, 44.8000],
+                ],
+                1500,
+                commune="40192",
+            )
+        ]
+        construire_cadastre_test(
+            self.repertoire,
+            CADASTRE_LANDES,
+            lande_adjacente,
+        )
+        gironde = self.cadastre.rechercher_reference("33522", "AB", "2")
+        lande = CadastreLandes(self.repertoire).rechercher_reference(
+            "40192", "AB", "1"
+        )
+
+        fusion = fusionner_parcelles([gironde, lande])
+
+        self.assertEqual(fusion.geometrie_geojson["type"], "Polygon")
+        self.assertEqual(fusion.surface_cadastrale, 2700)
+
+    def test_reprise_d_archive_verifie_aussi_l_espace_disque(self) -> None:
+        landes = CadastreLandes(self.repertoire)
+
+        with patch(
+            "prog_vol.cadastre.shutil.disk_usage",
+            return_value=SimpleNamespace(free=0),
+        ):
+            with self.assertRaisesRegex(ErreurCadastre, "3 Go"):
+                landes.installer()
+
+    def test_archive_reutilisee_est_supprimee_si_l_indexation_echoue(self) -> None:
+        landes = CadastreLandes(self.repertoire)
+        archive = self.repertoire / CADASTRE_LANDES.nom_archive
+        archive.write_bytes(b"archive invalide")
+
+        with (
+            patch("prog_vol.cadastre._archive_reutilisable", return_value=True),
+            patch(
+                "prog_vol.cadastre.construire_base_depuis_archive",
+                side_effect=ErreurCadastre("archive tronquée"),
+            ),
+        ):
+            with self.assertRaisesRegex(ErreurCadastre, "tronquée"):
+                landes.installer()
+
+        self.assertFalse(archive.exists())
+
+    def test_indexation_refuse_des_coordonnees_tronquees(self) -> None:
+        archive = self.repertoire / "coordonnees-tronquees.json.gz"
+        destination = self.repertoire / "tronquee.sqlite"
+        geometrie_aplatie = feature(
+            "40192000CD0001",
+            "1",
+            [[-1, 43], [-1, 43], [-1, 43], [-1, 43]],
+            1500,
+            commune="40192",
+        )
+        with gzip.open(archive, "wt", encoding="utf-8") as sortie:
+            json.dump(
+                {"type": "FeatureCollection", "features": [geometrie_aplatie]},
+                sortie,
+            )
+
+        with self.assertRaisesRegex(ErreurCadastre, "aplaties|précision"):
+            construire_base_depuis_archive(
+                archive,
+                destination,
+                configuration=CADASTRE_LANDES,
+                nombre_minimum=1,
+            )
+
+        self.assertFalse(destination.exists())
 
 
 if __name__ == "__main__":
