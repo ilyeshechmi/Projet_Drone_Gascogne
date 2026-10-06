@@ -65,6 +65,7 @@ MAP_HTML = """<!DOCTYPE html>
     let points = [];
     let pointMarkers = [];
     let outline = null;
+    let flightZone = null;
     let waypointLayer = L.layerGroup().addTo(map);
     let parcellesSelectionnees = L.geoJSON(null, {
       style: {color:'#ad5a13', weight:3, fillColor:'#f2a65a', fillOpacity:.27},
@@ -182,6 +183,19 @@ MAP_HTML = """<!DOCTYPE html>
         if (outline) map.fitBounds(outline.getBounds(), {padding:[35,35]});
         updateHint();
       },
+      setFlightZonePolygon: function(coordinates) {
+        if (flightZone) map.removeLayer(flightZone);
+        flightZone = null;
+        if (coordinates && coordinates.length >= 3) {
+          flightZone = L.polygon(coordinates, {
+            color:'#6f4aa8', weight:2.5, dashArray:'8 7', fill:false
+          }).addTo(map).bindTooltip('Zone de vol avec marge');
+        }
+      },
+      clearFlightZone: function() {
+        if (flightZone) map.removeLayer(flightZone);
+        flightZone = null;
+      },
       afficherParcellesSelectionnees: function(collection) {
         parcellesSelectionnees.clearLayers();
         if (collection && collection.features) {
@@ -195,6 +209,8 @@ MAP_HTML = """<!DOCTYPE html>
         drawingClosed = false;
         if (outline) map.removeLayer(outline);
         outline = null;
+        if (flightZone) map.removeLayer(flightZone);
+        flightZone = null;
         waypointLayer.clearLayers();
         parcellesSelectionnees.clearLayers();
         if (homeMarker) map.removeLayer(homeMarker);
@@ -360,6 +376,13 @@ class MissionMapWidget(QWidget):
         self._run_script(f"window.kaelMap.setMissionPolygon({payload});")
         self.polygon_changed.emit(self.points)
         self.polygon_closed_changed.emit(True)
+
+    def set_flight_zone(self, points: tuple[tuple[float, float], ...]) -> None:
+        payload = json.dumps(points, separators=(",", ":"))
+        self._run_script(f"window.kaelMap.setFlightZonePolygon({payload});")
+
+    def clear_flight_zone(self) -> None:
+        self._run_script("window.kaelMap.clearFlightZone();")
 
     def afficher_parcelles_selectionnees(self, collection: dict) -> None:
         payload = json.dumps(collection, ensure_ascii=False, separators=(",", ":"))

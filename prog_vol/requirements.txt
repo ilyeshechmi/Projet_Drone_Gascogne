@@ -6,3 +6,4 @@ PyQtWebEngine-Qt5==5.15.19
 geopy==2.4.1
 ijson==3.4.0
 shapely==2.1.1
+pyproj==3.7.2

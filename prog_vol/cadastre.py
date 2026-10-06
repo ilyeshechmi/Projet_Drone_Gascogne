@@ -63,7 +63,10 @@ CADASTRE_GIRONDE = ConfigurationCadastre(
     nom="Gironde",
     taille_archive_estimee=235_520_575,
     nombre_minimum_parcelles=100_000,
+
 )
+
+
 CADASTRE_LANDES = ConfigurationCadastre(
     code="40",
     nom="Landes",
@@ -71,6 +74,8 @@ CADASTRE_LANDES = ConfigurationCadastre(
     nombre_minimum_parcelles=100_000,
 )
 CONFIGURATIONS_CADASTRALES = (CADASTRE_GIRONDE, CADASTRE_LANDES)
+
+
 
 # Alias conservés pour les utilisateurs de l'ancienne API Gironde.
 URL_PARCELLES_GIRONDE = CADASTRE_GIRONDE.url
@@ -120,6 +125,7 @@ class ParcelleCadastrale:
     geometrie_wkb: bytes
     code_departement: str = ""
     nom_departement: str = ""
+
 
     @property
     def cle(self) -> str:
@@ -328,6 +334,8 @@ def telecharger_archive(
         raise
 
 
+
+
 def construire_base_depuis_archive(
     archive: Path,
     destination: Path,
@@ -534,6 +542,12 @@ def construire_base_depuis_archive(
         connexion.close()
         temporaire.unlink(missing_ok=True)
         raise
+
+
+
+
+
+
 
 
 class CadastreDepartement:

@@ -67,6 +67,7 @@ from .generator import (
     generate_mission_parts,
     generate_route_polygon,
 )
+from .geometry import ZoneGeometryError, buffer_zone_points
 from .main import configure_logging
 from .map_widget import MissionMapWidget
 from .missions import MissionArchive, MissionError, inspect_mission
@@ -110,6 +111,7 @@ def friendly_error(exc: Exception) -> str:
             MissionError,
             StorageError,
             TransferError,
+            ZoneGeometryError,
             OSError,
         ),
     ):
@@ -162,6 +164,9 @@ class ValidationWorker(Worker):
 class MissionPreparation:
     output_path: Path
     parameters: MissionParameters
+    zone_originale: tuple[tuple[float, float], ...]
+    zone_vol: tuple[tuple[float, float], ...]
+    coverage_margin_m: float
     route: GeneratedRoute
     batteries: tuple[BatteryState, ...]
     reserve_percent: float
@@ -208,6 +213,7 @@ class GenerationWorker(Worker):
         home_point: tuple[float, float] | None,
         batteries: tuple[BatteryState, ...],
         reserve_percent: float,
+        coverage_margin_m: float,
     ) -> None:
         super().__init__()
         self.points = points
@@ -216,9 +222,14 @@ class GenerationWorker(Worker):
         self.home_point = home_point
         self.batteries = batteries
         self.reserve_percent = reserve_percent
+        self.coverage_margin_m = coverage_margin_m
 
     def work(self) -> MissionPreparation:
-        route = generate_route_polygon(self.points, self.parameters)
+        zone_originale = tuple(
+            (float(latitude), float(longitude)) for latitude, longitude in self.points
+        )
+        zone_vol = buffer_zone_points(zone_originale, self.coverage_margin_m)
+        route = generate_route_polygon(zone_vol, self.parameters)
         estimate = estimate_flight(
             route.waypoints,
             self.parameters.drone_speed,
@@ -244,6 +255,9 @@ class GenerationWorker(Worker):
         return MissionPreparation(
             output_path=self.output_path,
             parameters=self.parameters,
+            zone_originale=zone_originale,
+            zone_vol=zone_vol,
+            coverage_margin_m=self.coverage_margin_m,
             route=route,
             batteries=self.batteries,
             reserve_percent=self.reserve_percent,
@@ -837,6 +851,11 @@ class GenerationTab(ThreadedPanel):
         self.add_battery()
 
         controls_layout.addWidget(self._section_label("Zone de mission"))
+        zone_form = QFormLayout()
+        zone_form.setSpacing(9)
+        self.coverage_margin = self._spin(0, 1000, 0, 1, " m", 1)
+        zone_form.addRow("Marge de couverture", self.coverage_margin)
+        controls_layout.addLayout(zone_form)
         self.point_status = QLabel("Aucun sommet placé.")
         self.point_status.setObjectName("mutedSmall")
         controls_layout.addWidget(self.point_status)
@@ -864,6 +883,13 @@ class GenerationTab(ThreadedPanel):
         home_buttons.addWidget(self.place_home_button)
         home_buttons.addWidget(self.clear_home_button)
         controls_layout.addLayout(home_buttons)
+
+        self.preview_button = QPushButton("Calculer la trajectoire")
+        self.preview_button.setObjectName("secondaryButton")
+        self.preview_button.setMinimumHeight(38)
+        self.preview_button.setEnabled(False)
+        self.preview_button.clicked.connect(self.calculate_route_preview)
+        controls_layout.addWidget(self.preview_button)
 
         self.generate_button = QPushButton("Générer le fichier KMZ")
         self.generate_button.setObjectName("primaryButton")
@@ -1208,6 +1234,7 @@ class GenerationTab(ThreadedPanel):
 
     @pyqtSlot(bool)
     def polygon_closed_changed(self, closed: bool) -> None:
+        self.preview_button.setEnabled(closed)
         self.generate_button.setEnabled(closed)
         self.close_button.setEnabled(not closed and len(self.map_widget.points) >= 3)
         if closed:
@@ -1232,6 +1259,30 @@ class GenerationTab(ThreadedPanel):
         self.map_widget.set_mode_selection(self.mode_zone.currentIndex() == 1)
         self.result_label.setText("La mission générée sera résumée ici.")
 
+    def _start_preparation(self, output_path: Path, success_slot) -> None:
+        try:
+            batteries = self.battery_states()
+        except AutonomyError as exc:
+            QMessageBox.warning(self, "Batteries", str(exc))
+            return
+        self.map_widget.clear_flight_zone()
+        self.start_worker(
+            GenerationWorker(
+                list(self.map_widget.points),
+                self.parameters(),
+                output_path,
+                self.map_widget.home_point,
+                batteries,
+                self.reserve.value(),
+                self.coverage_margin.value(),
+            ),
+            success_slot,
+        )
+
+    def calculate_route_preview(self) -> None:
+        self.result_label.setText("Calcul de la trajectoire et de l'autonomie...")
+        self._start_preparation(APP_ROOT / "mission_preview.kmz", self.preview_completed)
+
     def choose_output_and_generate(self) -> None:
         default = APP_ROOT / "mission_waypoints.kmz"
         selected, _filter = QFileDialog.getSaveFileName(
@@ -1244,29 +1295,19 @@ class GenerationTab(ThreadedPanel):
             self.generate_to(Path(selected))
 
     def generate_to(self, output_path: Path) -> None:
-        try:
-            batteries = self.battery_states()
-        except AutonomyError as exc:
-            QMessageBox.warning(self, "Batteries", str(exc))
-            return
         self.result_label.setText("Calcul de la trajectoire et de l'autonomie...")
-        self.start_worker(
-            GenerationWorker(
-                list(self.map_widget.points),
-                self.parameters(),
-                output_path,
-                self.map_widget.home_point,
-                batteries,
-                self.reserve.value(),
-            ),
-            self.preparation_completed,
-        )
+        self._start_preparation(output_path, self.preparation_completed)
+
+    @pyqtSlot(object)
+    def preview_completed(self, preparation: MissionPreparation) -> None:
+        self._show_prepared_route(preparation)
+        self.result_label.setText(self._preparation_details(preparation, preview=True))
 
     @pyqtSlot(object)
     def preparation_completed(self, preparation: MissionPreparation) -> None:
+        self._show_prepared_route(preparation)
         plan = preparation.split_plan
         if plan is None:
-            self.map_widget.show_waypoints(preparation.route.waypoints)
             if preparation.assessment.level is AlertLevel.CRITICAL:
                 self.result_label.setText(
                     preparation.assessment.message
@@ -1283,15 +1324,11 @@ class GenerationTab(ThreadedPanel):
             return
 
         if not plan.possible:
-            self.map_widget.show_waypoints(preparation.route.waypoints)
             self.result_label.setText(plan.reason)
             QMessageBox.critical(self, "Découpage impossible", plan.reason)
             return
 
         if plan.requires_split:
-            self.map_widget.show_mission_parts(
-                tuple(part.waypoints for part in plan.parts)
-            )
             answer = QMessageBox.question(
                 self,
                 "Découper la mission",
@@ -1306,6 +1343,75 @@ class GenerationTab(ThreadedPanel):
                 )
                 return
         self._write_prepared_mission(preparation)
+
+    def _show_prepared_route(self, preparation: MissionPreparation) -> None:
+        if preparation.coverage_margin_m > 0:
+            self.map_widget.set_flight_zone(preparation.zone_vol)
+        plan = preparation.split_plan
+        if plan is not None and plan.possible and plan.requires_split:
+            self.map_widget.show_mission_parts(
+                tuple(part.waypoints for part in plan.parts)
+            )
+        else:
+            self.map_widget.show_waypoints(preparation.route.waypoints)
+
+    def _preparation_details(
+        self,
+        preparation: MissionPreparation,
+        *,
+        preview: bool = False,
+    ) -> str:
+        estimate = preparation.flight_estimate
+        distance_line = f"Distance dans la zone : {estimate.route_distance_m / 1000:.2f} km"
+        if estimate.transit_distance_m is not None:
+            distance_line += f" • transit : {estimate.transit_distance_m / 1000:.2f} km"
+        else:
+            distance_line += " • transit non calculé"
+        assessment = preparation.assessment
+        details = [
+            (
+                "Trajectoire calculée : "
+                if preview
+                else "Mission prête : "
+            )
+            + f"{len(preparation.route.waypoints)} waypoints sur "
+            f"{preparation.route.line_count} passe(s), {estimate.photo_count} photos prévues.",
+            distance_line,
+            f"Marge de couverture : {preparation.coverage_margin_m:.1f} m",
+            f"Durée estimée : {human_duration(estimate.estimated_duration_s)}",
+        ]
+        plan = preparation.split_plan
+        if plan is None:
+            details.append(f"Autonomie : {assessment.message}")
+        elif plan.possible:
+            details.append(plan.reason)
+            if plan.requires_split:
+                for number, part in enumerate(plan.parts, start=1):
+                    details.append(
+                        f"Partie {number}/{len(plan.parts)} : "
+                        f"{part.waypoint_count} WP, {part.battery.name}, "
+                        f"{human_duration(part.flight_estimate.estimated_duration_s)}, "
+                        f"marge {human_duration(max(0, part.margin_s))}."
+                    )
+            else:
+                details.append(f"Autonomie : {assessment.message}")
+        else:
+            details.append(plan.reason)
+        if estimate.short_photo_intervals:
+            details.append(
+                f"Cadence photo : {estimate.short_photo_intervals} segment(s) trop courts "
+                "pour l'intervalle choisi."
+            )
+        if assessment.estimated_profile_used:
+            details.append(
+                "Une autonomie de batterie personnalisée a été extrapolée depuis les Wh."
+            )
+        details.append(
+            f"FOV : {preparation.route.fov_width:.1f} × {preparation.route.fov_height:.1f} m"
+        )
+        if preview:
+            details.append("Aucun fichier KMZ n'a été créé.")
+        return "\n".join(details)
 
     def _write_prepared_mission(self, preparation: MissionPreparation) -> None:
         self.result_label.setText("Création et validation des fichiers KMZ...")
@@ -1335,6 +1441,7 @@ class GenerationTab(ThreadedPanel):
             f"Mission prête : {len(preparation.route.waypoints)} waypoints sur "
             f"{preparation.route.line_count} passe(s), {estimate.photo_count} photos prévues.",
             distance_line,
+            f"Marge de couverture : {preparation.coverage_margin_m:.1f} m",
             f"Durée estimée : {human_duration(estimate.estimated_duration_s)}",
             (
                 f"Découpage validé en {len(items)} parties sûres."
@@ -1401,6 +1508,7 @@ class GenerationTab(ThreadedPanel):
             not busy and not self.map_widget.is_closed and len(self.map_widget.points) >= 3
         )
         self.reset_button.setEnabled(not busy)
+        self.preview_button.setEnabled(not busy and self.map_widget.is_closed)
         self.generate_button.setEnabled(not busy and self.map_widget.is_closed)
         for button in self.install_cadastre_buttons.values():
             button.setEnabled(not busy)
@@ -1408,6 +1516,7 @@ class GenerationTab(ThreadedPanel):
         self.add_battery_button.setEnabled(not busy)
         self.reserve.setEnabled(not busy)
         self.photo_mode.setEnabled(not busy)
+        self.coverage_margin.setEnabled(not busy)
         self.place_home_button.setEnabled(not busy)
         self.clear_home_button.setEnabled(not busy and self.map_widget.home_point is not None)
         for row in self.battery_rows:

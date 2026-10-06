@@ -22,3 +22,95 @@ Traceback (most recent call last):
     ...<2 lines>...
     )
 get_latest_drone_photo.DroneError: Aucun drone DJI detecte. Verifiez l'alimentation, le cable USB de donnees et le mode de transfert. Volumes montes: Macintosh HD
+2026-09-24 09:59:52,340 | ERROR | Dummy-1 | Echec de l'import des missions
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/transfer.py", line 112, in _copy_verified
+    while chunk := source_stream.read(1024 * 1024):
+                   ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+OSError: [Errno 6] Device not configured
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/gui.py", line 153, in run
+    summary = import_missions(
+        self.missions,
+    ...<2 lines>...
+        progress_callback=self.progress.emit,
+    )
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/transfer.py", line 212, in import_missions
+    copied, checksum = _copy_verified(photo, destination)
+                       ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/transfer.py", line 132, in _copy_verified
+    raise TransferError(f"Impossible de copier {photo.name}: {exc}") from exc
+drone_importer.transfer.TransferError: Impossible de copier DJI_20260923152018_0533_D.JPG: [Errno 6] Device not configured
+2026-09-24 10:02:06,272 | ERROR | Dummy-1 | Echec de l'analyse du drone
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/gui.py", line 118, in run
+    scan = scan_drone_photos(
+        include_jpeg=self.include_jpeg,
+        include_dng=self.include_dng,
+    )
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/core.py", line 148, in scan_drone_photos
+    raise DroneError(
+    ...<2 lines>...
+    )
+get_latest_drone_photo.DroneError: Le drone DJI est detecte, mais son stockage n'est pas accessible. Media detecte: aucun media USB. Volumes montes: Macintosh HD
+2026-10-04 16:17:28,490 | ERROR | Dummy-1 | Echec de l'analyse du drone
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/gui.py", line 118, in run
+    scan = scan_drone_photos(
+        include_jpeg=self.include_jpeg,
+        include_dng=self.include_dng,
+    )
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/core.py", line 148, in scan_drone_photos
+    raise DroneError(
+    ...<2 lines>...
+    )
+get_latest_drone_photo.DroneError: Le drone DJI est detecte, mais son stockage n'est pas accessible. Media detecte: aucun media USB. Volumes montes: Macintosh HD
+2026-10-04 16:17:32,266 | ERROR | Dummy-2 | Echec de l'analyse du drone
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/gui.py", line 118, in run
+    scan = scan_drone_photos(
+        include_jpeg=self.include_jpeg,
+        include_dng=self.include_dng,
+    )
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/core.py", line 148, in scan_drone_photos
+    raise DroneError(
+    ...<2 lines>...
+    )
+get_latest_drone_photo.DroneError: Le drone DJI est detecte, mais son stockage n'est pas accessible. Media detecte: aucun media USB. Volumes montes: Macintosh HD
+2026-10-04 17:48:13,962 | ERROR | Dummy-3 | Echec de l'analyse du drone
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/gui.py", line 118, in run
+    scan = scan_drone_photos(
+        include_jpeg=self.include_jpeg,
+        include_dng=self.include_dng,
+    )
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/core.py", line 148, in scan_drone_photos
+    raise DroneError(
+    ...<2 lines>...
+    )
+get_latest_drone_photo.DroneError: Le drone DJI est detecte, mais son stockage n'est pas accessible. Media detecte: aucun media USB. Volumes montes: Macintosh HD
+2026-10-04 17:51:12,368 | ERROR | Dummy-4 | Echec de l'import des missions
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/transfer.py", line 112, in _copy_verified
+    while chunk := source_stream.read(1024 * 1024):
+                   ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+OSError: [Errno 6] Device not configured
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/gui.py", line 153, in run
+    summary = import_missions(
+        self.missions,
+    ...<2 lines>...
+        progress_callback=self.progress.emit,
+    )
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/transfer.py", line 212, in import_missions
+    copied, checksum = _copy_verified(photo, destination)
+                       ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/Users/ilyeshechmi/Desktop/Enseirb/Stage_3A/Kael/Projet_Drone_Gascogne/DJI_Photo_Importer/drone_importer/transfer.py", line 132, in _copy_verified
+    raise TransferError(f"Impossible de copier {photo.name}: {exc}") from exc
+drone_importer.transfer.TransferError: Impossible de copier DJI_20261004171424_0732_D.JPG: [Errno 6] Device not configured
